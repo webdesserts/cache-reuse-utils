@@ -1,27 +1,30 @@
 # scr-planner
 
 This library is the planning side of Suffix Cache Reuse (SCR) in our Dwarfstar
-integration: Dwarfstar discovers reusable spans of already-computed context, and
-this crate turns those candidates into the best geometrically valid plan it can
-find before an absolute deadline. `CacheReuseAnalysis` is implemented today as a
-thin wrapper over caller-supplied candidates; discovery from context tokens and a
-cache view is still future work.
+integration: Dwarfstar owns cache state and execution, while this crate discovers
+qualifying exact matches in a borrowed logical cache view and turns them into the
+best geometrically valid plan it can find before an absolute deadline.
 
 ## Use it
 
-One configured analysis call validates candidates, searches under one absolute
-deadline, and returns the best geometrically valid plan found. `cancel` is a
-whole-request stop; a usable plan is returned as `Ok(plan)` even when the
-deadline stops further search.
+One configured analysis call validates the logical inputs, discovers maximal
+exact matches, searches under one absolute deadline, and returns an owned plan.
+`cancel` is a whole-request stop; a usable plan is returned as `Ok(plan)` even
+when the deadline stops further work.
 
 ```rust
-# use scr_planner::{CacheReuseAnalysis, CandidateRange, PlanError, ReusePlan};
+# use scr_planner::{CacheIdentity, CacheReuseAnalysis, CacheView, PlanError, ReusePlan};
 # use std::time::{Duration, Instant};
-fn analyze_reuse(candidates: &[CandidateRange]) -> Result<ReusePlan, PlanError> {
+fn analyze_reuse(context: &[u32], cache: &[u32]) -> Result<ReusePlan, PlanError> {
     let mut cancel = || false; // caller-owned whole-request cancellation
     CacheReuseAnalysis {
-        candidates,                         // supplied by discovery/mapping today
-        k: 6,                               // at most six selected ranges
+        context_tokens: context,
+        cache: CacheView {
+            tokens: cache,
+            identity: CacheIdentity::new(7),
+            minimum_match_tokens: 4,
+        },
+        k: 6, // at most six selected ranges
         deadline: Instant::now() + Duration::from_secs(5),
         cancel: &mut cancel,
     }
@@ -29,9 +32,11 @@ fn analyze_reuse(candidates: &[CandidateRange]) -> Result<ReusePlan, PlanError> 
 }
 
 # fn main() -> Result<(), PlanError> {
-let plan = analyze_reuse(&[])?; // empty input is explicit no-reuse
-assert!(plan.ranges().is_empty());
-assert_eq!(plan.covered_tokens(), 0);
+let plan = analyze_reuse(&[10, 20, 30, 40, 50], &[90, 10, 20, 30, 40, 50, 90])?;
+assert_eq!(plan.covered_tokens(), 5);
+assert_eq!(plan.cache_identity(), CacheIdentity::new(7));
+assert!(plan.timing().discovery().is_some());
+assert!(plan.timing().search().is_some());
 # Ok(())
 # }
 ```
@@ -44,44 +49,52 @@ Why this shape:
   `PlanError::BudgetExhausted { stage, timing }`; callers handle that normally
   rather than panicking or inventing an empty plan.
 - **One absolute deadline, not opaque ticks.** The five seconds are illustrative.
-  Analysis records a start checkpoint, passes the same monotonic `Instant`
-  deadline through preparation and search, and records search-start and finish
-  checkpoints. A deadline already in the past is handled as zero remaining time.
-  Search may finish early and returns immediately (no sleeping to fill the
-  budget). Final plan checking and return are a small bounded tail, so this is a
-  cooperative soft deadline, not hard realtime. Native prefill/decode is not
-  included.
+  After validation/no-work handling, analysis registers one monotonic `Instant`
+  deadline with a background timer owner; discovery/search read a per-analysis
+  notification flag at natural loop points, with cancellation checked first.
+  Clock reads record stage-start and finish checkpoints for telemetry. A deadline already in the past is handled as zero
+  remaining time. Work may finish early and returns immediately (no sleeping to
+  fill the budget). Final checking and return are a small bounded tail, so this
+  is a cooperative soft deadline, not hard realtime. Native prefill/decode is
+  not included.
 - **Metadata lives on the plan or error.** `ReusePlan` exposes ranges, covered
-  tokens and `AnalysisTiming` (`elapsed`, `limit`, `reached`, `preparation`,
-  optional `search`); errors that stop an attempt carry the same timing plus the
-  stage (`Preparation`, `Search` or `Finish`). `reached` only says the finish
-  checkpoint met the absolute deadline; it never implies more search should occur.
+  tokens, cache identity, discovery status and `AnalysisTiming` (`elapsed`,
+  `limit`, `reached`, `preparation`, optional `discovery`, optional `search`);
+  errors carry timing plus the stage (`Preparation`, `Discovery`, `Search` or
+  `Finish`). `reached` only says the finish checkpoint met the deadline; it never
+  implies more work should occur.
 - **One internal policy.** There is no public objective or strategy choice. The
   selector maximizes covered tokens; ties go to fewer final coalesced ranges,
   then the lexicographically smaller normalized final plan.
-- **Empty no-reuse is deliberate.** A validated empty plan is distinct from
-  having no plan at all; a deadline is never converted into an empty plan. Empty
-  input returns that plan after validation without starting search, unless
-  cancellation wins.
+- **Empty no-reuse is deliberate.** A complete no-match, empty input or a
+  minimum longer than an input is a valid empty plan. Incomplete discovery with
+  no verified plan is an error, never a fabricated empty plan. No-work no-match
+  remains complete even if the deadline is already past.
+- **Discovery has bounded, explicit quality.** Discovery enumerates maximal
+  exact logical matches at every logical position, at least
+  `minimum_match_tokens` long. It does not enumerate every trimmed subrange, so a
+  plan is best over the declared maximal-match pool, not a global claim over all
+  alignments. If the 4096-candidate capacity is reached, verified candidates are
+  retained, search still uses only remaining time, and the plan reports
+  `DiscoveryStatus::CandidateLimitReached`. Inputs are bounded to 1,048,576
+  logical tokens per side; the modeled heap payload is about 24.05 MiB at that
+  cap and the admission ceiling is 32 MiB, excluding allocator overhead and a
+  separate O(log N) sort stack. Larger inputs are admission errors rather than
+  silent truncation.
 - **Refusals stay distinct.** Whole-request cancellation is checked first and is
-  not a budget stop; admission failure (planner allocation/scratch), invalid
-  input and invariant failures are separate. Geometry never proves token
-  equality or model-state equivalence; native validation and execution remain
-  authoritative.
-
-`CacheReuseAnalysis` currently takes caller-supplied candidates. Its planned
-input change to context tokens plus a bounded read-only cache view, with
-discovery running before search, is described in
-[`docs/dream-api.md`](docs/dream-api.md) and is **not implemented**. This public
-wrapper is not completed discovery or cache analysis.
+  not a budget stop; admission refusal carries a typed input/buffer/allocation/
+  timer reason, while invalid input and invariant failures remain separate. Geometry and identity metadata never prove token equality,
+  model-state equivalence or native placement; native validation and execution
+  remain authoritative.
 
 ## What SCR is
 
 Suffix Cache Reuse lets Dwarfstar reuse context that has already been computed
 when a new request shares a suffix or span with it, avoiding a full recomputation.
-This crate targets the planning side of that integration; matching, token
-identity, source bounds, model-state equivalence and execution safety stay
-native. Upstream Dwarfstar does not provide SCR by default — this series adds it
+This crate targets the planning side of that integration: it discovers exact
+logical matches and selects a logical plan. Native token identity/extents,
+physical placement, cache-state compatibility, model-state equivalence and
+execution safety stay native. Upstream Dwarfstar does not provide SCR by default — this series adds it
 through our integration patches. Approximate reuse can depend on the old
 left-context being close enough to the new one.
 
@@ -99,19 +112,15 @@ References:
 
 ## Current status and TODO
 
-- [x] **Working thin `CacheReuseAnalysis` over caller-supplied candidates.**
-  Validation, one absolute deadline shared by preparation and search, best valid
-  incumbent on deadline, cancellation precedence, coalescing/K geometry, owned
-  `ReusePlan` timing metadata; covered by public API, exhaustive-oracle and
-  fake-clock tests.
-- [ ] **Full context/cache analysis.** `CacheReuseAnalysis` gains context-token
-  and read-only cache-view inputs; Rust discovers candidates before search, then
-  returns a reuse plan. Discovery is not implemented today and the public wrapper
-  must not be read as completing it. Future design:
-  [`docs/dream-api.md`](docs/dream-api.md).
-- [ ] **Dwarfstar adapter and native validation.** Source token identity/extents,
-  cache-state compatibility, allocation admission and a conservative FFI
-  boundary. Native code still owns cache state and execution.
+- [x] **Working full Rust `CacheReuseAnalysis` over a borrowed logical cache
+  view.** Context/cache inputs, explicit minimum qualifying length, exact maximal
+  match discovery, candidate-cap status, one absolute deadline across
+  preparation/discovery/search, best valid plan, cancellation precedence,
+  coalescing/K geometry, identity and timing metadata; covered by public API,
+  maximal-match/search-oracle and controlled-clock tests.
+- [ ] **Dwarfstar adapter and native validation.** Native projection/pinning,
+  physical positions, cache-state compatibility, allocation admission and a
+  conservative FFI boundary. Native code still owns cache state and execution.
 - [ ] **Measured performance and bounded parallel search.** Benchmarks/cost model
   and parallel candidate evaluation only after the correctness baseline; no
   speed claim yet.
@@ -125,7 +134,7 @@ future/proposed, not settled promises.
 - [Current API](docs/current-api.md): executable examples and error behavior.
 - [Design notes](docs/design.md): ownership, units, candidates, deadlines and
   validity boundaries.
-- [Future dream API](docs/dream-api.md): planned context/cache discovery input,
+- [Future dream API](docs/dream-api.md): native adapter and placement boundary,
   not implemented today.
 - [Future research](docs/futurte-research.md): search-quality and performance
   questions, evaluation ideas and testing notes.

@@ -1,6 +1,8 @@
 //! Returned reuse plans and selected-plan geometry validation.
 
+use crate::cache_view::CacheIdentity;
 use crate::candidate::{CandidateRange, MAX_RANGES};
+use crate::discovery::DiscoveryStatus;
 use crate::error::PlanGeometryError;
 use crate::timing::AnalysisTiming;
 
@@ -10,6 +12,8 @@ pub struct ReusePlan {
     ranges: Vec<CandidateRange>,
     covered_tokens: u64,
     timing: AnalysisTiming,
+    cache_identity: CacheIdentity,
+    discovery_status: DiscoveryStatus,
 }
 
 impl ReusePlan {
@@ -17,6 +21,8 @@ impl ReusePlan {
         ranges: Vec<CandidateRange>,
         k: u32,
         timing: AnalysisTiming,
+        cache_identity: CacheIdentity,
+        discovery_status: DiscoveryStatus,
     ) -> Result<Self, PlanGeometryError> {
         validate_plan(&ranges, k)?;
         let covered_tokens = ranges.iter().map(|range| range.token_count as u64).sum();
@@ -24,6 +30,8 @@ impl ReusePlan {
             ranges,
             covered_tokens,
             timing,
+            cache_identity,
+            discovery_status,
         })
     }
 
@@ -37,6 +45,17 @@ impl ReusePlan {
 
     pub fn timing(&self) -> AnalysisTiming {
         self.timing
+    }
+
+    /// Caller identity round-tripped from the cache view, including for an
+    /// empty plan. This is binding metadata, not native staleness proof.
+    pub fn cache_identity(&self) -> CacheIdentity {
+        self.cache_identity
+    }
+
+    /// Whether discovery was complete or stopped at the candidate capacity.
+    pub fn discovery_status(&self) -> DiscoveryStatus {
+        self.discovery_status
     }
 }
 

@@ -1,38 +1,45 @@
-# Future dream API (discovery not implemented)
+# Future dream API: native integration boundary
 
-`CacheReuseAnalysis::analyze` exists today as a thin wrapper over
-caller-supplied candidates. The shape below is the intended later whole-analysis
-call: context tokens plus a read-only cache view, with Rust discovering
-candidates before search. That discovery input and matching are **not
-implemented**; no cache snapshot or discovery scaffolding is exposed yet. This
-example is not compiled and is not a claim about the current API.
+`CacheReuseAnalysis::analyze` now performs full Rust discovery over a borrowed
+logical cache view, followed by the existing search. What remains future is the
+native adapter: projecting pads, pinning a cache snapshot, translating logical
+positions to physical placement, validating generation/model state and executing
+the proposal.
+
+The current implemented call is:
 
 ```rust,ignore
-use scr_planner::{CacheReuseAnalysis, PlanError, ReusePlan};
-use std::time::{Duration, Instant};
-
 let mut cancel = || false;
-let result: Result<ReusePlan, PlanError> = CacheReuseAnalysis {
-    context_tokens,                      // logical tokens of the new request
-    cache: bounded_read_only_cache_view, // retained model/cache view, borrowed
+let result = CacheReuseAnalysis {
+    context_tokens,
+    cache: CacheView {
+        tokens: logical_cache_tokens,
+        identity: CacheIdentity::new(caller_identity),
+        minimum_match_tokens: 128,
+    },
     k: 6,
     deadline: Instant::now() + Duration::from_secs(5),
     cancel: &mut cancel,
-}
-.analyze();
-
-match result {
-    Ok(plan) => native_execute(plan), // native owns tensors/state/execution
-    Err(PlanError::BudgetExhausted { timing, .. }) => fallback_without_reuse(timing),
-    Err(PlanError::Cancelled { .. }) => stop_the_request(),
-    Err(PlanError::AdmissionDenied { .. }) => fallback(),
-    Err(PlanError::InvalidInput { reason, .. }) => surface_input_error(reason),
-    Err(PlanError::Invariant { reason, .. }) => surface_internal_failure(reason),
-}
+}.analyze();
 ```
 
-Open design questions for later: the exact read-only cache view boundary, how
-Rust discovers candidates without taking ownership of cache tensors, how source
-token identity/extents are validated, and the C adapter/FFI copy boundary. Native
-code remains authoritative for cache state, model-state equivalence and
-execution; the Rust side returns only a plan proposal.
+`CacheView` is one borrowed eligible logical source. `CacheIdentity` is opaque
+caller binding metadata and is round-tripped by the plan; it is not proof of
+cache freshness, token identity or executability. Native code still owns the
+source snapshot, pads, physical positions, model/cache generations, placement,
+allocation and execution.
+
+The future native path is expected to:
+
+1. Pin one eligible sealed source and reject use while it can retire or rebase.
+2. Project pads to logical tokens and supply a logical `CacheView` plus identity.
+3. Run this crate's discovery/search; receive a logical `ReusePlan`.
+4. Map logical ranges to native physical positions and revalidate token identity,
+   bounds, alignment, pad correspondence, generation and execution eligibility.
+5. Execute only if native validation succeeds; otherwise fall back without
+   treating the Rust plan or identity as authorization.
+
+Open native questions are the exact FFI token/view copy boundary, physical
+position mapping ownership, and how a rejected proposal is reported alongside
+the native receipt. They are not implemented here. This document does not promise
+that logical token equality implies model-state equivalence or safe reuse.

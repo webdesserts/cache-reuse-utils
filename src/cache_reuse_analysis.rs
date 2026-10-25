@@ -1,398 +1,308 @@
-//! Public one-shot cache-reuse analysis and its checkpoint orchestration.
+//! Public one-shot cache-reuse analysis and its stage orchestration.
 
 use std::time::Instant;
 
-use crate::candidate::{CandidateRange, MAX_SCRATCH_BYTES, STACK_RESERVE_BYTES, validate_pool};
-use crate::candidate_search::{CandidateSearch, SearchError};
-use crate::error::{PlanError, geometry_reason};
+use crate::cache_view::CacheView;
+use crate::candidate::MAX_RANGES;
+use crate::candidate_search::CandidateSearch;
+use crate::discovery::{DiscoveryStatus, MAX_DISCOVERY_TOKENS, discover};
+use crate::error::{AdmissionDeniedReason, ContractError, InputSide, PlanError, geometry_reason};
 use crate::reuse_plan::ReusePlan;
-use crate::timing::{AnalysisStage, AnalysisTiming, CheckOutcome, DeadlineClock};
+use crate::timing::{AnalysisStage, AnalysisTiming, CheckOutcome, DeadlineClock, TimingState};
 
 /// One cache-reuse analysis request.
 ///
-/// This is the README entry point. Today callers supply candidate ranges
-/// directly; a later version will take incoming context tokens and a read-only
-/// cache view, run discovery, then search. Discovery remains unimplemented, so
-/// no cache snapshot or matching is fabricated here.
+/// This is the README entry point. Callers provide logical context tokens and
+/// one borrowed eligible cache source; discovery finds exact qualifying matches
+/// and the private selector chooses a legal plan. Native integration still owns
+/// projection, cache pinning, physical placement and execution proof.
 ///
-/// `deadline` is one absolute monotonic instant shared by preparation and
-/// search; it is not a per-stage budget. `cancel` is a whole-request stop that
-/// takes precedence over the deadline. Call [`analyze`](Self::analyze).
+/// `deadline` is one absolute monotonic instant shared by preparation, discovery
+/// and search; it is not a per-stage budget. `cancel` is a whole-request stop
+/// that takes precedence over the deadline.
 pub struct CacheReuseAnalysis<'a> {
-    pub candidates: &'a [CandidateRange],
+    pub context_tokens: &'a [u32],
+    pub cache: CacheView<'a>,
     pub k: u32,
     pub deadline: Instant,
     pub cancel: &'a mut dyn FnMut() -> bool,
 }
 
 impl<'a> CacheReuseAnalysis<'a> {
-    /// Validate input and search for the best valid plan before `deadline`.
+    /// Validate input, discover qualifying exact matches, and select a legal
+    /// plan under `deadline`.
     ///
-    /// A valid plan already found is returned as `Ok` even when the deadline
-    /// stopped further search. With no plan found before the deadline this is
-    /// [`PlanError::BudgetExhausted`]. Deliberately empty input is valid and
-    /// returns an empty plan; cancellation wins and never returns a plan.
+    /// Complete discovery with no qualifying match is a deliberate empty plan.
+    /// A valid plan found before the deadline is returned even when the deadline
+    /// stopped further work. Incomplete discovery with no plan is an
+    /// informative error, never a fabricated empty plan. Cancellation wins.
     pub fn analyze(self) -> Result<ReusePlan, PlanError> {
         let CacheReuseAnalysis {
-            candidates,
+            context_tokens,
+            cache,
             k,
             deadline,
             cancel,
         } = self;
         let mut clock = DeadlineClock::start(deadline, cancel);
-        analyze_with_clock(candidates, k, &mut clock)
+        analyze_with_clock(context_tokens, cache, k, &mut clock)
     }
 }
 
 fn analyze_with_clock(
-    candidates: &[CandidateRange],
+    context: &[u32],
+    cache: CacheView<'_>,
     k: u32,
     clock: &mut DeadlineClock<'_>,
 ) -> Result<ReusePlan, PlanError> {
-    // Cancellation is checked before validation and before any deadline work.
-    if clock.cancelled() {
-        return Err(error_at(
-            clock,
-            AnalysisStage::Preparation,
-            None,
-            SearchError::Cancelled,
-        ));
-    }
-    let validated = match validate_pool(candidates, k) {
-        Ok(validated) => validated,
-        Err(reason) => {
-            let finish = clock.now();
-            if clock.cancelled() {
-                return Err(PlanError::Cancelled {
-                    stage: AnalysisStage::Preparation,
-                    timing: timing(clock, None, finish),
-                });
-            }
-            return Err(PlanError::InvalidInput {
-                reason,
-                stage: AnalysisStage::Preparation,
-                timing: timing(clock, None, finish),
-            });
-        }
-    };
-    if validated.reserved_bytes() > MAX_SCRATCH_BYTES + STACK_RESERVE_BYTES {
-        return Err(error_at(
-            clock,
-            AnalysisStage::Preparation,
-            None,
-            SearchError::AdmissionDenied,
-        ));
-    }
+    validate_request(context, &cache, k, clock)?;
 
-    // Empty input is the explicit no-reuse request: there is nothing to search,
-    // so an expired deadline does not invent a failure. Cancellation still wins.
-    if candidates.is_empty() {
+    // A no-work no-match is a complete result, even past the deadline. It does
+    // not fabricate discovery/search stages.
+    if cannot_match(context, &cache) {
         let finish = clock.now();
         if clock.cancelled() {
-            return Err(PlanError::Cancelled {
-                stage: AnalysisStage::Preparation,
-                timing: timing(clock, None, finish),
-            });
+            return Err(PlanError::cancelled(
+                AnalysisStage::Preparation,
+                AnalysisTiming::preparation_only(clock, finish),
+            ));
         }
-        let timing = timing(clock, None, finish);
-        return ReusePlan::from_parts(Vec::new(), k, timing).map_err(|error| {
-            PlanError::Invariant {
-                reason: geometry_reason(error),
-                stage: AnalysisStage::Finish,
-                timing,
-            }
-        });
+        return complete_empty_plan(&cache, k, AnalysisTiming::preparation_only(clock, finish));
     }
 
-    // Preparation checkpoint: validation and admission are inside deadline
-    // awareness, and a past deadline stops before search starts.
+    // Start the background deadline owner only after validation and the
+    // statically known no-work decision. Registration failure fails closed.
+    if clock.arm_timer().is_err() {
+        let finish = clock.now();
+        return Err(PlanError::admission(
+            AdmissionDeniedReason::TimerUnavailable,
+            AnalysisStage::Preparation,
+            AnalysisTiming::preparation_only(clock, finish),
+        ));
+    }
+
+    // The preparation checkpoint is the last point before discovery.
     match clock.check() {
         CheckOutcome::Cancelled => {
-            return Err(error_at(
-                clock,
+            let finish = clock.now();
+            return Err(PlanError::cancelled(
                 AnalysisStage::Preparation,
-                None,
-                SearchError::Cancelled,
+                AnalysisTiming::preparation_only(clock, finish),
             ));
         }
         CheckOutcome::DeadlineReached => {
-            return Err(error_at(
-                clock,
+            let finish = clock.now();
+            return Err(PlanError::budget(
                 AnalysisStage::Preparation,
-                None,
-                SearchError::BudgetExhausted,
+                AnalysisTiming::preparation_only(clock, finish),
+            ));
+        }
+        CheckOutcome::Continue => {}
+    }
+
+    let mut stages = TimingState::new(clock.now());
+    let discovery = match discover(context, cache, clock) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let finish = clock.now();
+            stages.discovery_finished(finish);
+            return Err(PlanError::from_discovery(
+                AnalysisStage::Discovery,
+                stages.finish(clock, finish),
+                error,
+            ));
+        }
+    };
+    let discovery_end = clock.now();
+    stages.discovery_finished(discovery_end);
+
+    if discovery.ranges.is_empty() {
+        // Actual discovery that completes no-match after an observed expiry is
+        // not a fabricated empty plan. Only the statically known no-work path
+        // above may return empty despite expiry.
+        match clock.check() {
+            CheckOutcome::Cancelled => {
+                return Err(PlanError::cancelled(
+                    AnalysisStage::Discovery,
+                    stages.finish(clock, discovery_end),
+                ));
+            }
+            CheckOutcome::DeadlineReached => {
+                return Err(PlanError::budget(
+                    AnalysisStage::Discovery,
+                    stages.finish(clock, discovery_end),
+                ));
+            }
+            CheckOutcome::Continue => {}
+        }
+        return complete_empty_plan(&cache, k, stages.finish(clock, discovery_end));
+    }
+
+    // A candidate bag is not an incumbent. Once expiry is observed, refuse
+    // search entry; cancellation still wins.
+    match clock.check() {
+        CheckOutcome::Cancelled => {
+            return Err(PlanError::cancelled(
+                AnalysisStage::Discovery,
+                stages.finish(clock, discovery_end),
+            ));
+        }
+        CheckOutcome::DeadlineReached => {
+            return Err(PlanError::budget(
+                AnalysisStage::Search,
+                stages.finish(clock, discovery_end),
             ));
         }
         CheckOutcome::Continue => {}
     }
 
     let search_start = clock.now();
-    let search = CandidateSearch::new(candidates, k);
-    match search.run(clock) {
+    // The search-start checkpoint closes discovery for accounting, including
+    // the small boundary interval before search is entered.
+    stages.discovery_finished(search_start);
+    match clock.check() {
+        CheckOutcome::Cancelled => {
+            return Err(PlanError::cancelled(
+                AnalysisStage::Search,
+                stages.finish(clock, search_start),
+            ));
+        }
+        CheckOutcome::DeadlineReached => {
+            return Err(PlanError::budget(
+                AnalysisStage::Search,
+                stages.finish(clock, search_start),
+            ));
+        }
+        CheckOutcome::Continue => {}
+    }
+    stages.search_started(search_start);
+    match CandidateSearch::new(&discovery.ranges, k).run(clock) {
         Err(error) => {
             let finish = clock.now();
-            Err(error_at_with_finish(
-                clock,
+            Err(PlanError::from_search(
                 AnalysisStage::Search,
-                Some(search_start),
-                finish,
+                stages.finish(clock, finish),
                 error,
             ))
         }
         Ok(ranges) => {
             let finish = clock.now();
-            let timing = timing(clock, Some(search_start), finish);
-            // Search already polls cancellation last; this catches a caller
-            // that flips it between that poll and plan construction.
+            let timing = stages.finish(clock, finish);
             if clock.cancelled() {
-                return Err(PlanError::Cancelled {
-                    stage: AnalysisStage::Finish,
-                    timing,
-                });
+                return Err(PlanError::cancelled(AnalysisStage::Finish, timing));
             }
-            ReusePlan::from_parts(ranges, k, timing).map_err(|error| PlanError::Invariant {
-                reason: geometry_reason(error),
-                stage: AnalysisStage::Finish,
-                timing,
-            })
+            ReusePlan::from_parts(ranges, k, timing, cache.identity, discovery.status).map_err(
+                |error| PlanError::invariant(geometry_reason(error), AnalysisStage::Finish, timing),
+            )
         }
     }
 }
 
-fn timing(
-    clock: &DeadlineClock<'_>,
-    search_start: Option<Instant>,
-    finish: Instant,
-) -> AnalysisTiming {
-    let started = clock.started();
-    let elapsed = finish.saturating_duration_since(started);
-    let preparation = search_start
-        .map(|start| start.saturating_duration_since(started))
-        .unwrap_or(elapsed);
-    let search = search_start.map(|start| finish.saturating_duration_since(start));
-    AnalysisTiming::new(
-        elapsed,
-        clock.limit(),
-        finish >= clock.deadline(),
-        preparation,
-        search,
-    )
-}
-
-fn error_at(
+fn validate_request(
+    context: &[u32],
+    cache: &CacheView<'_>,
+    k: u32,
     clock: &mut DeadlineClock<'_>,
-    stage: AnalysisStage,
-    search_start: Option<Instant>,
-    error: SearchError,
-) -> PlanError {
-    let finish = clock.now();
-    error_at_with_finish(clock, stage, search_start, finish, error)
+) -> Result<(), PlanError> {
+    if clock.cancelled() {
+        let finish = clock.now();
+        return Err(PlanError::cancelled(
+            AnalysisStage::Preparation,
+            AnalysisTiming::preparation_only(clock, finish),
+        ));
+    }
+    if k == 0 || k > MAX_RANGES {
+        let finish = clock.now();
+        return Err(PlanError::invalid_input(
+            ContractError::InvalidK { k, max: MAX_RANGES },
+            AnalysisStage::Preparation,
+            AnalysisTiming::preparation_only(clock, finish),
+        ));
+    }
+    if cache.minimum_match_tokens == 0 {
+        let finish = clock.now();
+        return Err(PlanError::invalid_input(
+            ContractError::InvalidMinimum {
+                minimum: cache.minimum_match_tokens,
+            },
+            AnalysisStage::Preparation,
+            AnalysisTiming::preparation_only(clock, finish),
+        ));
+    }
+    let input_side = if context.len() > MAX_DISCOVERY_TOKENS {
+        Some((InputSide::Context, context.len()))
+    } else if cache.tokens.len() > MAX_DISCOVERY_TOKENS {
+        Some((InputSide::Cache, cache.tokens.len()))
+    } else {
+        None
+    };
+    if let Some((side, got)) = input_side {
+        let finish = clock.now();
+        return Err(PlanError::admission(
+            AdmissionDeniedReason::InputTooLarge {
+                side,
+                got,
+                max: MAX_DISCOVERY_TOKENS,
+            },
+            AnalysisStage::Preparation,
+            AnalysisTiming::preparation_only(clock, finish),
+        ));
+    }
+    Ok(())
 }
 
-fn error_at_with_finish(
-    clock: &DeadlineClock<'_>,
-    stage: AnalysisStage,
-    search_start: Option<Instant>,
-    finish: Instant,
-    error: SearchError,
-) -> PlanError {
-    let timing = timing(clock, search_start, finish);
-    match error {
-        SearchError::Cancelled => PlanError::Cancelled { stage, timing },
-        SearchError::BudgetExhausted => PlanError::BudgetExhausted { stage, timing },
-        SearchError::AdmissionDenied => PlanError::AdmissionDenied { stage, timing },
-        SearchError::Invariant(reason) => PlanError::Invariant {
-            reason,
-            stage,
-            timing,
-        },
-    }
+fn cannot_match(context: &[u32], cache: &CacheView<'_>) -> bool {
+    context.is_empty()
+        || cache.tokens.is_empty()
+        || cache.minimum_match_tokens as usize > context.len()
+        || cache.minimum_match_tokens as usize > cache.tokens.len()
+}
+
+fn complete_empty_plan(
+    cache: &CacheView<'_>,
+    k: u32,
+    timing: AnalysisTiming,
+) -> Result<ReusePlan, PlanError> {
+    ReusePlan::from_parts(
+        Vec::new(),
+        k,
+        timing,
+        cache.identity,
+        DiscoveryStatus::Complete,
+    )
+    .map_err(|error| PlanError::invariant(geometry_reason(error), AnalysisStage::Finish, timing))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
-    use std::rc::Rc;
-
-    fn range(source_start: u32, destination_start: u32, token_count: u32) -> CandidateRange {
-        CandidateRange {
-            source_start,
-            destination_start,
-            token_count,
-        }
-    }
-
-    /// Clock that advances 1 ms per read and caps at `limit_ms`. The trace is
-    /// deterministic, including checkpoint reads; tests below state the exact
-    /// stopping point rather than accepting any valid result. The stop point is
-    /// intentionally coupled to checkpoint read order; this is not a semantic
-    /// clock abstraction.
-    fn advancing_clock(base: Instant, limit_ms: u64) -> (Rc<Cell<u64>>, impl FnMut() -> Instant) {
-        let calls = Rc::new(Cell::new(0u64));
-        let counter = Rc::clone(&calls);
-        let now = move || {
-            let elapsed = counter.get().min(limit_ms);
-            counter.set(counter.get() + 1);
-            base + std::time::Duration::from_millis(elapsed)
-        };
-        (calls, now)
-    }
-
-    fn fixed_clock(base: Instant) -> impl FnMut() -> Instant {
-        move || base
-    }
+    use crate::cache_view::CacheIdentity;
+    use std::time::Instant;
 
     #[test]
-    fn expiry_during_preparation_stops_before_search() {
-        let base = Instant::now();
+    fn timer_start_failure_is_preparation_admission_denied() {
+        crate::deadline::fail_next_registration();
         let mut cancel = || false;
-        let mut clock = DeadlineClock::with_clock(
-            base,
-            base + std::time::Duration::from_millis(5),
-            move || base + std::time::Duration::from_millis(5),
+        let cache = CacheView {
+            tokens: &[1, 2, 3],
+            identity: CacheIdentity::new(1),
+            minimum_match_tokens: 1,
+        };
+        let mut clock = DeadlineClock::start(
+            Instant::now() + std::time::Duration::from_secs(5),
             &mut cancel,
         );
-        match analyze_with_clock(&[range(0, 0, 4)], 1, &mut clock) {
-            Err(PlanError::BudgetExhausted { stage, timing }) => {
-                assert_eq!(stage, AnalysisStage::Preparation);
-                assert!(timing.reached());
+        match analyze_with_clock(&[1, 2, 3], cache, 1, &mut clock) {
+            Err(PlanError::AdmissionDenied {
+                reason: AdmissionDeniedReason::TimerUnavailable,
+                stage: AnalysisStage::Preparation,
+                timing,
+            }) => {
+                assert!(timing.discovery().is_none());
                 assert!(timing.search().is_none());
                 assert_eq!(timing.preparation(), timing.elapsed());
             }
-            other => panic!("expected prep BudgetExhausted, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn expiry_in_search_without_an_incumbent_stops_at_the_search_stage() {
-        let base = Instant::now();
-        let (_calls, now) = advancing_clock(base, 2);
-        let mut cancel = || false;
-        let mut clock = DeadlineClock::with_clock(
-            base,
-            base + std::time::Duration::from_millis(2),
-            now,
-            &mut cancel,
-        );
-        match analyze_with_clock(&[range(0, 0, 4)], 1, &mut clock) {
-            Err(PlanError::BudgetExhausted { stage, timing }) => {
-                assert_eq!(stage, AnalysisStage::Search);
-                assert!(timing.reached());
-                assert!(timing.search().is_some());
-            }
-            other => panic!("expected search BudgetExhausted, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn an_incumbent_survives_a_deadline_during_search() {
-        let base = Instant::now();
-        let (_calls, now) = advancing_clock(base, 3);
-        let mut cancel = || false;
-        let mut clock = DeadlineClock::with_clock(
-            base,
-            base + std::time::Duration::from_millis(3),
-            now,
-            &mut cancel,
-        );
-        let candidates = [range(0, 0, 4), range(10, 10, 3), range(20, 20, 2)];
-        let plan = analyze_with_clock(&candidates, 2, &mut clock).expect("incumbent");
-        assert!(!plan.ranges().is_empty());
-        assert!(plan.timing().reached());
-        assert!(plan.timing().search().is_some());
-        assert_eq!(
-            plan.timing().elapsed(),
-            plan.timing().preparation() + plan.timing().search().unwrap()
-        );
-    }
-
-    #[test]
-    fn deadline_publishes_computed_improvement_in_the_current_row() {
-        let base = Instant::now();
-        let (_calls, now) = advancing_clock(base, 7);
-        let mut cancel = || false;
-        let mut clock = DeadlineClock::with_clock(
-            base,
-            base + std::time::Duration::from_millis(7),
-            now,
-            &mut cancel,
-        );
-        let candidates = [range(0, 0, 4), range(0, 0, 5), range(10, 10, 6)];
-        let plan =
-            analyze_with_clock(&candidates, 2, &mut clock).expect("computed plan at deadline");
-        assert_eq!(plan.covered_tokens(), 10);
-        assert!(plan.timing().reached());
-    }
-
-    #[test]
-    fn deadline_publishes_coalesced_improvement_in_the_current_row() {
-        let base = Instant::now();
-        let (_calls, now) = advancing_clock(base, 7);
-        let mut cancel = || false;
-        let mut clock = DeadlineClock::with_clock(
-            base,
-            base + std::time::Duration::from_millis(7),
-            now,
-            &mut cancel,
-        );
-        let candidates = [range(0, 0, 4), range(0, 0, 5), range(4, 4, 6)];
-        let plan =
-            analyze_with_clock(&candidates, 2, &mut clock).expect("coalesced plan at deadline");
-        assert_eq!(plan.covered_tokens(), 10);
-        assert_eq!(plan.ranges(), &[range(0, 0, 10)]);
-        assert!(plan.timing().reached());
-    }
-
-    #[test]
-    fn cancellation_after_search_wins_even_with_an_incumbent() {
-        let base = Instant::now();
-        let calls = Rc::new(Cell::new(0u64));
-        let cancel_calls = Rc::clone(&calls);
-        let mut cancel = move || {
-            cancel_calls.set(cancel_calls.get() + 1);
-            cancel_calls.get() >= 10
-        };
-        let mut clock = DeadlineClock::with_clock(
-            base,
-            base + std::time::Duration::from_secs(10),
-            fixed_clock(base),
-            &mut cancel,
-        );
-        let candidates = [range(0, 0, 4), range(10, 10, 3), range(20, 20, 2)];
-        match analyze_with_clock(&candidates, 2, &mut clock) {
-            Err(PlanError::Cancelled { stage, timing }) => {
-                assert_eq!(stage, AnalysisStage::Finish);
-                assert!(!timing.reached());
-                assert!(timing.search().is_some());
-            }
-            other => panic!("expected Finish cancellation, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn cancellation_at_the_deadline_with_an_incumbent_is_cancelled() {
-        let base = Instant::now();
-        let (_calls, now) = advancing_clock(base, 7);
-        let calls = Rc::new(Cell::new(0u64));
-        let cancel_calls = Rc::clone(&calls);
-        let mut cancel = move || {
-            cancel_calls.set(cancel_calls.get() + 1);
-            cancel_calls.get() >= 9
-        };
-        let mut clock = DeadlineClock::with_clock(
-            base,
-            base + std::time::Duration::from_millis(7),
-            now,
-            &mut cancel,
-        );
-        let candidates = [range(0, 0, 4), range(0, 0, 5), range(10, 10, 6)];
-        match analyze_with_clock(&candidates, 2, &mut clock) {
-            Err(PlanError::Cancelled { stage, timing }) => {
-                assert_eq!(stage, AnalysisStage::Search);
-                assert!(timing.reached());
-            }
-            other => panic!("expected deadline cancellation, got {other:?}"),
+            other => panic!("expected TimerUnavailable at Preparation, got {other:?}"),
         }
     }
 }

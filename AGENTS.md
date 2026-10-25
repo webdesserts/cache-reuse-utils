@@ -14,6 +14,8 @@
 
   Keep the target directory at `<repo>/target`; never clean a shared cache or
   another workspace.
-- Keep the crate `std`-only, no `unsafe`, no retained C pointers or session
-  ownership; native state stays in Dwarfstar.
+- Keep the default production crate `std`-only, no `unsafe`, no retained C
+  pointers or session ownership; native state stays in Dwarfstar. The optional,
+  explicitly authorized `test-support` feature may use the pinned
+  `mock_instant` test dependency; it must never be enabled by default.
 - Comments and commits are reviewed by Michael before further work.

@@ -3,9 +3,18 @@ name = "scr-planner"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Bounded selector-first SCR planner contract (preparation slice)"
+description = "Bounded SCR cache-reuse discovery and plan selection"
 
 [dependencies]
+mock_instant = { version = "=0.6.1", optional = true }
+
+[features]
+test-support = ["dep:mock_instant"]
 
 [profile.release]
 panic = "abort"
+
+[[test]]
+name = "test_support_clock"
+path = "tests/test_support_clock.rs"
+required-features = ["test-support"]

@@ -124,22 +124,24 @@ this note.
 
 ## Testing research note
 
-`std::time::Instant` with a private injected clock remains appropriate for this
-synchronous deadline API:
+`std::time::Instant` with a private injected clock and a background deadline
+owner remains appropriate for this synchronous deadline API:
 
 - <https://doc.rust-lang.org/std/time/struct.Instant.html>
 
-Exact boundary and mid-search tests belong beside the clock owner; forcing them
-through the public API would require a test-only public hook or flaky real-time
-deadlines. Tokio's paused time virtualizes Tokio timers, not code reading
+Exact timer/flag boundary state tests remain beside the private deadline owner;
+public phase tests use the opt-in mock guard's explicit simulated expiry rather
+than real-time deadlines. Tokio's paused time virtualizes Tokio timers, not code reading
 `std::time::Instant::now()`:
 
 - <https://docs.rs/tokio/latest/tokio/time/fn.pause.html>
 
 The current fake clock's stop point is coupled to checkpoint read order, which is
 a known test-brittleness limitation rather than a semantic clock abstraction.
-`mock_instant` is an optional future consideration, not a recommended dependency;
-the private seam already isolates the clock read.
+`mock_instant` is not a production dependency; the opt-in `test-support`
+feature now uses it for a per-thread public test clock, while default builds and
+unarmed threads continue to read `std::time::Instant`. Exact phase targeting
+remains coupled to cancellation-poll order.
 
 ## Decision
 
