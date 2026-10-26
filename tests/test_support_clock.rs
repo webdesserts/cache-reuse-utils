@@ -6,7 +6,8 @@
 use mock_instant::thread_local::MockClock;
 use scr_planner::test_support::MockClockGuard;
 use scr_planner::{
-    AnalysisStage, CacheIdentity, CacheReuseAnalysis, CacheView, PlanError, ReusePlan,
+    AnalysisStage, CacheIdentity, CacheReuseAnalysis, CacheView, PlacementPolicy, PlanError,
+    ReusePlan,
 };
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
@@ -32,6 +33,7 @@ fn analyze(
         k,
         deadline,
         cancel,
+        placement: PlacementPolicy::default_for(context.len()),
     }
     .analyze()
 }
@@ -185,7 +187,7 @@ fn expired_actual_no_match_is_an_error_not_an_empty_plan() {
 fn search_and_finish_cancellation_map_through_public_errors() {
     let context = [1u32, 2, 3, 4, 11, 12, 13, 21, 22];
     let cache = [9u32, 1, 2, 3, 4, 8, 11, 12, 13, 7, 21, 22, 6];
-    for (threshold, expected_stage) in [(94, AnalysisStage::Search), (101, AnalysisStage::Finish)] {
+    for (threshold, expected_stage) in [(94, AnalysisStage::Search), (111, AnalysisStage::Finish)] {
         let clock = MockClockGuard::new().expect("guard");
         let deadline = clock
             .deadline_after(Duration::from_secs(10))

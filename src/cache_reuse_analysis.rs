@@ -4,9 +4,10 @@ use std::time::Instant;
 
 use crate::cache_view::CacheView;
 use crate::candidate::MAX_RANGES;
-use crate::candidate_search::CandidateSearch;
 use crate::discovery::{DiscoveryStatus, MAX_DISCOVERY_TOKENS, discover};
 use crate::error::{AdmissionDeniedReason, ContractError, InputSide, PlanError, geometry_reason};
+use crate::placement::{PlacementPolicy, PlacementStatus};
+use crate::placement_search::{PlacementOutcome, search};
 use crate::reuse_plan::ReusePlan;
 use crate::timing::{AnalysisStage, AnalysisTiming, CheckOutcome, DeadlineClock, TimingState};
 
@@ -26,6 +27,7 @@ pub struct CacheReuseAnalysis<'a> {
     pub k: u32,
     pub deadline: Instant,
     pub cancel: &'a mut dyn FnMut() -> bool,
+    pub placement: PlacementPolicy<'a>,
 }
 
 impl<'a> CacheReuseAnalysis<'a> {
@@ -43,9 +45,10 @@ impl<'a> CacheReuseAnalysis<'a> {
             k,
             deadline,
             cancel,
+            placement,
         } = self;
         let mut clock = DeadlineClock::start(deadline, cancel);
-        analyze_with_clock(context_tokens, cache, k, &mut clock)
+        analyze_with_clock(context_tokens, cache, k, &placement, &mut clock)
     }
 }
 
@@ -53,9 +56,10 @@ fn analyze_with_clock(
     context: &[u32],
     cache: CacheView<'_>,
     k: u32,
+    placement: &PlacementPolicy<'_>,
     clock: &mut DeadlineClock<'_>,
 ) -> Result<ReusePlan, PlanError> {
-    validate_request(context, &cache, k, clock)?;
+    validate_request(context, &cache, k, placement, clock)?;
 
     // A no-work no-match is a complete result, even past the deadline. It does
     // not fabricate discovery/search stages.
@@ -67,7 +71,13 @@ fn analyze_with_clock(
                 AnalysisTiming::preparation_only(clock, finish),
             ));
         }
-        return complete_empty_plan(&cache, k, AnalysisTiming::preparation_only(clock, finish));
+        return complete_empty_plan(
+            context.len(),
+            &cache,
+            k,
+            placement,
+            AnalysisTiming::preparation_only(clock, finish),
+        );
     }
 
     // Start the background deadline owner only after validation and the
@@ -135,7 +145,13 @@ fn analyze_with_clock(
             }
             CheckOutcome::Continue => {}
         }
-        return complete_empty_plan(&cache, k, stages.finish(clock, discovery_end));
+        return complete_empty_plan(
+            context.len(),
+            &cache,
+            k,
+            placement,
+            stages.finish(clock, discovery_end),
+        );
     }
 
     // A candidate bag is not an incumbent. Once expiry is observed, refuse
@@ -176,7 +192,7 @@ fn analyze_with_clock(
         CheckOutcome::Continue => {}
     }
     stages.search_started(search_start);
-    match CandidateSearch::new(&discovery.ranges, k).run(clock) {
+    match search(context.len(), &discovery.ranges, k, placement, clock) {
         Err(error) => {
             let finish = clock.now();
             Err(PlanError::from_search(
@@ -185,15 +201,24 @@ fn analyze_with_clock(
                 error,
             ))
         }
-        Ok(ranges) => {
+        Ok(outcome) => {
             let finish = clock.now();
             let timing = stages.finish(clock, finish);
             if clock.cancelled() {
                 return Err(PlanError::cancelled(AnalysisStage::Finish, timing));
             }
-            ReusePlan::from_parts(ranges, k, timing, cache.identity, discovery.status).map_err(
-                |error| PlanError::invariant(geometry_reason(error), AnalysisStage::Finish, timing),
+            ReusePlan::from_outcome(
+                context.len(),
+                k,
+                timing,
+                cache.identity,
+                discovery.status,
+                outcome,
+                placement,
             )
+            .map_err(|error| {
+                PlanError::invariant(geometry_reason(error), AnalysisStage::Finish, timing)
+            })
         }
     }
 }
@@ -202,6 +227,7 @@ fn validate_request(
     context: &[u32],
     cache: &CacheView<'_>,
     k: u32,
+    placement: &PlacementPolicy<'_>,
     clock: &mut DeadlineClock<'_>,
 ) -> Result<(), PlanError> {
     if clock.cancelled() {
@@ -236,6 +262,14 @@ fn validate_request(
     } else {
         None
     };
+    if let Err(reason) = placement.validate(context.len()) {
+        let finish = clock.now();
+        return Err(PlanError::invalid_placement(
+            reason,
+            AnalysisStage::Preparation,
+            AnalysisTiming::preparation_only(clock, finish),
+        ));
+    }
     if let Some((side, got)) = input_side {
         let finish = clock.now();
         return Err(PlanError::admission(
@@ -259,16 +293,27 @@ fn cannot_match(context: &[u32], cache: &CacheView<'_>) -> bool {
 }
 
 fn complete_empty_plan(
+    context_len: usize,
     cache: &CacheView<'_>,
     k: u32,
+    placement: &PlacementPolicy<'_>,
     timing: AnalysisTiming,
 ) -> Result<ReusePlan, PlanError> {
-    ReusePlan::from_parts(
-        Vec::new(),
+    ReusePlan::from_outcome(
+        context_len,
         k,
         timing,
         cache.identity,
         DiscoveryStatus::Complete,
+        PlacementOutcome {
+            plan: Vec::new(),
+            insertions: Vec::new(),
+            covered: 0,
+            padding: 0,
+            best_useful: 0,
+            status: PlacementStatus::Complete,
+        },
+        placement,
     )
     .map_err(|error| PlanError::invariant(geometry_reason(error), AnalysisStage::Finish, timing))
 }
@@ -292,7 +337,13 @@ mod tests {
             Instant::now() + std::time::Duration::from_secs(5),
             &mut cancel,
         );
-        match analyze_with_clock(&[1, 2, 3], cache, 1, &mut clock) {
+        match analyze_with_clock(
+            &[1, 2, 3],
+            cache,
+            1,
+            &PlacementPolicy::default_for(3),
+            &mut clock,
+        ) {
             Err(PlanError::AdmissionDenied {
                 reason: AdmissionDeniedReason::TimerUnavailable,
                 stage: AnalysisStage::Preparation,

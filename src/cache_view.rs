@@ -1,4 +1,4 @@
-//! Borrowed logical cache view and caller binding identity.
+//! Borrowed actual-token cache view and caller binding identity.
 
 /// Caller-supplied opaque binding metadata for a cache view.
 ///
@@ -18,17 +18,18 @@ impl CacheIdentity {
     }
 }
 
-/// One borrowed, eligible logical cache source.
+/// One borrowed, eligible actual-token cache source.
 ///
-/// `tokens` contains logical token IDs for the source stream; it is not a
-/// native tensor, physical transcript, or proof that a range is executable.
-/// `minimum_match_tokens` is the smallest exact contiguous match that may
-/// become a candidate. It must be greater than zero; a minimum longer than an
-/// input simply means there can be no qualifying match.
+/// `tokens` contains the actual token IDs represented by cached positions. Any
+/// historical artificial/intentional token is ordinary source content; the
+/// planner has no source layout/provenance and never classifies token values as
+/// padding. `minimum_match_tokens` is the smallest exact contiguous match that
+/// may become a candidate. It must be greater than zero; a minimum longer than
+/// an input simply means there can be no qualifying match.
 ///
-/// Native integration owns pad projection, source pinning, physical positions,
-/// generation checks, placement and execution. The identity is only binding
-/// metadata carried through the plan.
+/// Native integration still owns source pinning, physical positions, generation
+/// checks and execution. The identity is only binding metadata carried through
+/// the plan.
 #[derive(Debug, Clone, Copy)]
 pub struct CacheView<'a> {
     pub tokens: &'a [u32],

@@ -1,10 +1,10 @@
 # Future dream API: native integration boundary
 
-`CacheReuseAnalysis::analyze` now performs full Rust discovery over a borrowed
-logical cache view, followed by the existing search. What remains future is the
-native adapter: projecting pads, pinning a cache snapshot, translating logical
-positions to physical placement, validating generation/model state and executing
-the proposal.
+`CacheReuseAnalysis::analyze` performs full Rust discovery over a borrowed
+actual-token cache view, followed by placement-aware search. What remains future
+is the native adapter: pinning a cache snapshot, translating the returned recipe
+to physical placement, validating generation/model state and executing the
+proposal.
 
 The current implemented call is:
 
@@ -20,10 +20,11 @@ let result = CacheReuseAnalysis {
     k: 6,
     deadline: Instant::now() + Duration::from_secs(5),
     cancel: &mut cancel,
+    placement: PlacementPolicy::default_for(context_tokens.len()),
 }.analyze();
 ```
 
-`CacheView` is one borrowed eligible logical source. `CacheIdentity` is opaque
+`CacheView` is one borrowed eligible actual-token source. `CacheIdentity` is opaque
 caller binding metadata and is round-tripped by the plan; it is not proof of
 cache freshness, token identity or executability. Native code still owns the
 source snapshot, pads, physical positions, model/cache generations, placement,
@@ -32,9 +33,11 @@ allocation and execution.
 The future native path is expected to:
 
 1. Pin one eligible sealed source and reject use while it can retire or rebase.
-2. Project pads to logical tokens and supply a logical `CacheView` plus identity.
-3. Run this crate's discovery/search; receive a logical `ReusePlan`.
-4. Map logical ranges to native physical positions and revalidate token identity,
+2. Supply the actual cached-position token sequence as a `CacheView` plus
+   identity. There is no historical pad projection or provenance in this unit.
+3. Run this crate's discovery/placement search; receive actual source ranges,
+   a current-call insertion recipe and prepared-position mapping.
+4. Map the recipe to native physical positions and revalidate token identity,
    bounds, alignment, pad correspondence, generation and execution eligibility.
 5. Execute only if native validation succeeds; otherwise fall back without
    treating the Rust plan or identity as authorization.

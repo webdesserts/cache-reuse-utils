@@ -1,7 +1,7 @@
 //! Candidate ranges, pool constants and input validation.
 
-use crate::candidate_search::scratch_bytes;
 use crate::error::ContractError;
+use crate::placement_search::scratch_bytes;
 
 /// Maximum selected chain slots (`DS4_SCR_MULTI_MAX_RANGES`).
 pub const MAX_RANGES: u32 = 6;

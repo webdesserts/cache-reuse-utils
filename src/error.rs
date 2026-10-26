@@ -1,7 +1,8 @@
 //! Public error types for candidate input, selected-plan geometry and analysis.
 
-use crate::candidate_search::SearchError;
 use crate::discovery::DiscoveryError;
+use crate::placement::{PlacementConfigError, PlacementStatus};
+use crate::placement_search::SearchError;
 use crate::timing::{AnalysisStage, AnalysisTiming};
 
 /// Why a candidate pool or analysis input was rejected. Only arithmetic and
@@ -43,6 +44,7 @@ pub enum PlanGeometryError {
     Misordered { index: usize },
     CrossingOrOverlap { index: usize },
     AdjacentRanges { index: usize },
+    InvalidPlacementRecipe,
 }
 
 /// Which input side exceeded discovery's supported envelope.
@@ -89,6 +91,12 @@ pub enum PlanError {
         stage: AnalysisStage,
         timing: AnalysisTiming,
     },
+    /// Placement policy fields were inconsistent or outside declared limits.
+    InvalidPlacementPolicy {
+        reason: PlacementConfigError,
+        stage: AnalysisStage,
+        timing: AnalysisTiming,
+    },
     /// The deadline stopped search before any valid plan was found.
     BudgetExhausted {
         stage: AnalysisStage,
@@ -104,6 +112,12 @@ pub enum PlanError {
     /// This is distinct from native model-state or execution validation.
     AdmissionDenied {
         reason: AdmissionDeniedReason,
+        stage: AnalysisStage,
+        timing: AnalysisTiming,
+    },
+    /// Placement exploration stopped before any valid non-empty plan existed.
+    PlacementIncomplete {
+        status: PlacementStatus,
         stage: AnalysisStage,
         timing: AnalysisTiming,
     },
@@ -148,6 +162,18 @@ impl PlanError {
         }
     }
 
+    pub(crate) fn invalid_placement(
+        reason: PlacementConfigError,
+        stage: AnalysisStage,
+        timing: AnalysisTiming,
+    ) -> Self {
+        Self::InvalidPlacementPolicy {
+            reason,
+            stage,
+            timing,
+        }
+    }
+
     pub(crate) fn invariant(
         reason: &'static str,
         stage: AnalysisStage,
@@ -171,6 +197,11 @@ impl PlanError {
             SearchError::AdmissionDenied => {
                 Self::admission(AdmissionDeniedReason::Allocation, stage, timing)
             }
+            SearchError::LimitReached(status) => Self::PlacementIncomplete {
+                status,
+                stage,
+                timing,
+            },
             SearchError::Invariant(reason) => Self::invariant(reason, stage, timing),
         }
     }
@@ -198,5 +229,6 @@ pub(crate) fn geometry_reason(error: PlanGeometryError) -> &'static str {
         PlanGeometryError::Misordered { .. } => "selected ranges are misordered",
         PlanGeometryError::CrossingOrOverlap { .. } => "selected ranges cross or overlap",
         PlanGeometryError::AdjacentRanges { .. } => "adjacent selected ranges were not coalesced",
+        PlanGeometryError::InvalidPlacementRecipe => "placement recipe is inconsistent",
     }
 }

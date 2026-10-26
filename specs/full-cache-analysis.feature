@@ -78,3 +78,71 @@ Feature: Full cache-reuse analysis
     When analysis has real work to perform
     Then it returns AdmissionDenied at Preparation with TimerUnavailable timing
     And it does not fall back to loop clock comparisons
+
+  Scenario: Stateless source tokens are actual content
+    Given a cache view containing historical artificial or whitespace-like token values
+    When placement runs
+    Then those tokens are eligible source content
+    And no token value is classified as padding
+    And only insertions made by this analysis count toward padding
+
+  Scenario: Canonical insertion in a fresh gap
+    Given a placement policy allows insertions at several boundaries in one fresh gap
+    And the next reused span requires a current-call pad count
+    When a variant is placed
+    Then the pads are inserted at the latest allowed boundary before that span
+    And the prepared ranges and insertion record reflect that canonical choice
+
+  Scenario: Minimal current-call pads dominate alignment multiples
+    Given one fixed pad token, no per-boundary cap and no position-dependent constraints
+    When the smallest pad count satisfies target alignment and minimum prepared start
+    Then adding a full alignment multiple cannot improve future residues or K
+    And the minimum count is used
+
+  Scenario: Relative allowance retains a lower-padding alternative
+    Given a completed plan of 980 useful tokens requiring two pads
+    And an 850-token plan below the 882 ten-percent floor
+    And a 900-token zero-pad plan within the floor
+    Then the selected plan uses 900 useful tokens and zero pads
+
+  Scenario: Trim rectangle is explicit and bounded
+    Given a maximal match and caller-declared left/right trim bounds
+    When placement variants are generated
+    Then every non-empty trim inside that rectangle is considered
+    And completeness is claimed only over that declared domain
+
+  Scenario: Complete no-feasible placement is not a discovered no-match
+    Given maximal matches exist but every declared placement variant is infeasible
+    When search completes without a deadline or resource stop
+    Then the empty plan reports NoFeasibleReuse
+    And a complete no-match remains a distinct deliberate empty result
+
+  Scenario: Variant or state limit returns a completed plan honestly
+    Given a valid completed plan exists when a placement bound is reached
+    Then the best completed plan is returned
+    And its placement status reports the reached limit
+    And no empty plan is fabricated
+
+  Scenario: One hundred percent allowance empty edge
+    Given no positive completed plan exists when the deadline or a resource limit stops search
+    Then analysis returns BudgetExhausted or the limiter error, not an empty plan
+    And after a positive completed plan establishes B, an empty zero-pad plan may compete at 100%
+
+  Scenario: Capacity is cumulative across multiple fresh gaps
+    Given a plan needs current-call insertions in more than one gap
+    When placement checks capacity
+    Then original target length plus all accumulated padding is within the declared maximum
+    And a per-transition check alone is insufficient
+
+  Scenario: Variant derivation is interruptible
+    Given a large declared trim rectangle whose variants may all be rejected
+    When cancellation or the absolute deadline is observed during nested trim iteration
+    Then derivation stops immediately with the typed stop
+    And search does not start on an unverified variant bag
+    And there is no work-counter or modulo polling rule
+
+  Scenario: Completed plans survive state admission limits
+    Given a fully computed plan has been published to its padding bucket
+    When optional extension-state or modeled payload admission reaches its cap
+    Then the completed plan remains available with an explicit state-limit status
+    And a cap before any completed plan returns an informative limiter error
