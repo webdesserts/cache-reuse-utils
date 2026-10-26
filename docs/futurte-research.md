@@ -2,8 +2,7 @@
 
 This note records research directions for later work. Nothing here is
 implemented, scheduled or a performance claim. The current contract and error
-behavior remain authoritative in [`design.md`](design.md) and
-[`dream-api.md`](dream-api.md).
+behavior are documented in rustdoc and [`design.md`](design.md).
 
 ## Current baseline
 

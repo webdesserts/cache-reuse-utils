@@ -1,133 +1,84 @@
-# Design note: selector-first contract
+# Design notes
 
-## Dream API first
+This note explains the planner's search and resource model.
 
-The caller experience comes first: one configured analysis takes logical context
-tokens, one borrowed logical cache view, `K`, one absolute deadline and
-cancellation, then returns a geometrically checked plan with timing and binding
-metadata or a specific refusal. `CacheReuseAnalysis::analyze` implements Rust
-discovery and one placement-aware search over actual cached tokens; native
-pinning, physical execution and adapter validation remain future work. A
-caller-declared `PlacementPolicy` supplies the relative loss allowance,
-protected prefix/fresh suffix, insertion boundaries, optional pad token,
-alignments, minimum prepared start/physical count, capacity, trim bounds and
-bounded variant limits.
+## Discovery domain
 
-The result is an ordinary `Result<ReusePlan, PlanError>`: a valid plan is `Ok`
-even if the deadline stopped further work; exhaustion without a plan is
-`PlanError::BudgetExhausted { stage, timing }`; cancellation, admission, invalid
-input and invariant failures remain distinct. `ReusePlan` and every error carry
-`AnalysisTiming { elapsed, limit, reached, preparation, discovery, search }`
-measured from one monotonic clock, plus a stopping stage on errors. A complete
-no-match is a deliberate empty plan; incomplete discovery with no plan is an
-error. The objective is an explicit relative floor followed by minimum current-call
-insertions, maximum useful coverage, fewer final coalesced ranges and stable
-lexicographic order. `B` is the best completed useful coverage;
-`admissible_min = B - floor(B * basis_points / 10000)`. Completed buckets are
-tracked by inserted-padding count, with a high-coverage fallback, so a rising
-`B` cannot leave a stale below-floor incumbent.
+The planner borrows one actual-token cache source and an original target. It
+discovers maximal exact contiguous matches at every target boundary, at least
+`minimum_match_tokens` long. These maximal matches are alternatives and may
+overlap; they are not an enumeration of every trimmed substring. A plan is
+complete only over the declared maximal-match, trim-rectangle and placement
+domain, not over every possible substring or native alignment.
 
-Concrete friction to watch: a self-owned `ReusePlan` keeps the Rust call simple
-but needs a deliberate copy boundary for the future C adapter and caller-owned
-buffers; hiding validation/scratch/budget behind one call reduces wiring but
-must still expose enough diagnostics for native admission decisions.
+Historical pad or whitespace tokens are ordinary token values. Only insertion
+records created by the current call are padding. Source coordinates, cache
+generations and physical placement remain adapter responsibilities.
 
-Background and the original references (research paper and Astra’s Dwarfstar
-recipe, with their approximation caveats) are listed in the repository README
-under “What SCR is”. Build and test instructions live in `CONTRIBUTING.md`.
+## Placement and search
 
-## Ownership
+Each maximal match can be trimmed within the policy's bounded left/right
+rectangle. The search places a valid range into a fresh gap at the canonical
+latest permitted boundary, using the smallest current-call padding that satisfies
+the declared alignments and minimum prepared start. Adjacent compatible ranges
+are coalesced and consume one final K slot; non-adjacent ranges consume separate
+slots. Final ranges are ordered, non-crossing and non-overlapping.
 
-Upstream Dwarfstar does not provide SCR by default; this series adds it through
-our integration patches. Native code owns cache/tensor/session state, token
-identity, physical extents, pinning and execution. The Rust crate borrows one
-actual-token cache slice for a synchronous call, discovers candidates and
-returns a stateless placement recipe; it stores no pointers between calls. A
-future C adapter will supply the actual-token view and opaque identity, then map
-the recipe through native positions and revalidate it. No `Vec`/`String` or native
-tensor handle crosses the ABI.
+The search proceeds in stages:
 
-## Units
+1. derive the bounded trim variants;
+2. place variants and extend valid plans, respecting prefix/suffix, capacity and
+   insertion permissions;
+3. publish completed best-by-padding plans into buckets while retaining
+   extension frontiers in separate states;
+4. compute the best useful coverage `B` and the relative admissible floor;
+5. choose the least-padding eligible completed plan.
 
-`source_start` and `destination_start` are logical token indices in the actual
-retained source and original target sequences, and `token_count` is a token
-count. A placed range additionally records its prepared start. All are `u32` and
-half-open. The recipe's prepared ranges and current-call insertion counts are
-returned to the caller; native physical mapping and execution stay native.
+The achievable floor is `B - floor(B * basis_points / 10000)`. Within that floor,
+the planner minimizes current-call padding, then maximizes useful tokens, then
+prefers fewer final ranges and stable lexicographic order. A high-coverage
+fallback prevents an early below-floor incumbent from hiding a later better
+plan. Buckets store completed plans; extension states may continue to grow.
+Publishing a completed bucket before admitting its extension state keeps the
+valid incumbent available if later modeled state admission reaches its limit.
 
-## Candidates and selected plans
+## Deadline, cancellation and limits
 
-Discovery emits maximal contiguous exact logical matches at least
-`minimum_match_tokens` long, at every logical position. Maximal matches are
-alternatives and may conflict; they remain competing candidates for the search.
-This is not an enumeration of every trimmed subrange. The caller-declared
-bounded trim rectangle and canonical latest-boundary/minimal-current-pad rule
-define the domain; a plan is best over that declared maximal-match/trim/
-placement domain, not a global claim over all substrings or native alignments. The
-selected plan is ordered by destination then source, non-crossing,
-non-overlapping, and free of touching ranges because those are coalesced before
-output. `validate_plan` checks output compatibility. A complete no-match or
-explicit empty input is deliberate no-reuse.
+Analysis uses one absolute monotonic deadline and a caller cancellation callback.
+Cancellation wins at each checkpoint. The deadline is cooperative; it is checked
+at natural discovery/search iterations and phase boundaries. A valid incumbent is
+returned with a partial status when a deadline or exploration cap stops further
+search. Without an incumbent, deadline exhaustion is a typed error rather than an
+empty plan. Exact stage timing is recorded for telemetry.
 
-## Budget, cancellation and incumbent
+A bag of candidates is not an incumbent. Discovery may stop at its candidate
+capacity while retaining verified matches. Variant and modeled-state caps are
+exploration/resource limits: with a valid incumbent they produce a partial status,
+and without one they produce an incomplete refusal.
 
-`CacheReuseAnalysis` records an analysis-start checkpoint, then registers one
-absolute deadline with a lazy shared timer owner after validation/no-work
-handling. The owner sets a per-analysis notification flag; discovery and search
-read it at natural loop points. There are no work-step counters or modulo
-scheduling. Cancellation is a separate callback and is checked first; the flag is
-only a notification and carries no data. Clock reads remain at phase boundaries
-for `elapsed`, `limit`, `reached`, `preparation`, optional `discovery` and
-optional `search`; present-stage durations sum to `elapsed`. The timer is
-unregistered by RAII on early completion. A deadline before the start can set the
-flag at registration. A deadline during discovery stops before new search and
-yields `BudgetExhausted` at Discovery; candidates followed by expiry before
-search yield `BudgetExhausted` at Search with no search duration. A bag of
-candidates is not an incumbent. The deadline covers validation and Rust
-preparation/discovery/search, not native prefill/decode. Final checking and
-return are a small bounded tail: a cooperative soft deadline, not hard realtime.
-`reached` is a finish-time telemetry observation and may differ from the timer
-notification under scheduler delay.
+A configured `max_new_padding` above `MAX_NEW_PADDING` is invalid policy. A
+candidate requiring more padding than the caller's declared `max_new_padding` is
+outside the feasible domain; that may yield a smaller valid plan or a complete
+no-reuse result, but it is not a policy error and does not by itself produce an
+incomplete refusal.
 
-A valid incumbent found before the deadline is returned as `Ok(plan)` even when
-the deadline stopped further search. No valid incumbent found before the
-deadline yields `BudgetExhausted` with the same timing; exhaustion never
-fabricates an empty plan. Complete no-match/empty no-work analysis returns a
-deliberate empty plan. Discovery candidate capacity is the only expected partial
-limit; exact verified candidates are retained, search runs only while time
-remains, and the plan reports `DiscoveryStatus::CandidateLimitReached`. Inputs
-are bounded to 1,048,576 logical tokens per side; the modeled placement payload
-ceiling is 32 MiB. This excludes allocator overhead and a separate O(log N) sort
-stack; larger inputs are admission errors. Placement state accounting uses the
-actual admitted state/index/recipe model, not a dense closed-form worst case.
-No work-tick cap masquerades as a time stop. Cancellation wins over the deadline
-and never authorises continuing inference with a plan, even if an incumbent
-exists. Admission failure and invariant errors are separate. Timer
-registration/start failure is a typed `AdmissionDeniedReason::TimerUnavailable`
-at Preparation and fails closed; it is not a clock fallback. Raw candidate-pool
-scratch is still modeled by `scratch_bytes`; placement variants are admitted by
-the separate placement payload model, and discovery uses separate modeled
-input/index admission. Placement admission includes variants, `StateKey` order
-entries, state/bucket plans and insertion capacities. A 4 MiB publication reserve
-covers the modeled maximum bucket payload:
-`(MAX_NEW_PADDING+1) * size_of::<Option<Partial>>() +
-(MAX_NEW_PADDING+1) * (size_of::<Partial>() +
-K * (size_of::<PlacedRange>() + size_of::<Insertion>()))`.
-This is a conservative modeled upper bound; allocator, `HashMap` table and spare
-`Vec` overhead are documented exclusions, not RSS claims. Actual allocation
-failures remain `AdmissionDenied`; only modeled caps become limit statuses.
+Placement admission uses the actual modeled variant/state/recipe payload, not a
+dense closed-form worst case. The publication reserve covers the maximum modeled
+bucket payload; bucket storage is retained so a later state limit cannot discard a
+completed plan already found. Allocator overhead and hash-table/spare-capacity
+details are outside that model. The three numeric caps are provisional engineering
+bounds; they are not calibrated workload percentiles and real-history measurement
+is still pending.
 
-## Validity is not equivalence
+## Validity boundary
 
-A range that passes arithmetic and compatibility checks is not proof that the
-reused tokens match or that model state is equivalent. Token equality, source
-extents and execution safety remain native obligations.
+Structural and token-content checks are not equivalence proofs. A valid plan does
+not establish that native cache state matches the source, that physical positions
+are executable, or that model-state reuse is safe. The adapter must revalidate
+tokens, bounds, alignments, generations and cache eligibility before execution.
 
-## Deliberately deferred
+## Deferred work
 
-Historical source-pad provenance/projection, the Dwarfstar adapter and FFI,
-coverage-by-K reporting, greedy fallback, parallel/interleaved search, GPU
-placement, and any performance claim or benchmark. Logical maximal-match
-discovery, stateless placement variants, bounded state/bucket search,
-deterministic ties and best-completed-plan selection described above are
-implemented in Rust.
+Native projection/pinning and execution are separate adapter work. Parallel or
+interleaved search, alternative fallback policies, coverage-by-K reporting and
+performance calibration are not part of this planner revision.

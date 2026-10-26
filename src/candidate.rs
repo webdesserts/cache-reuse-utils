@@ -1,16 +1,10 @@
-//! Candidate ranges, pool constants and input validation.
+//! Candidate ranges and planner admission bounds.
 
-use crate::error::ContractError;
-use crate::placement_search::scratch_bytes;
-
-/// Maximum selected chain slots (`DS4_SCR_MULTI_MAX_RANGES`).
-pub const MAX_RANGES: u32 = 6;
+/// Maximum selected chain slots. Raised to 10 for the Ren deployment; this is
+/// still a planner-admission bound, not a native execution promise.
+pub const MAX_RANGES: u32 = 10;
 /// Maximum candidate pool size (`DS4_SCR_DENSE_RANGES_MAX`).
-pub const MAX_CANDIDATES: usize = 4096;
-/// Reference ceiling for the modeled scratch payload (`DS41_COVERAGE_BYTES_MAX`).
-pub const MAX_SCRATCH_BYTES: u64 = 1024 * 1024;
-/// Stack reserve added to admitted scratch (`DS41_COVERAGE_STACK_RESERVE`).
-pub const STACK_RESERVE_BYTES: u64 = 4096;
+pub(crate) const MAX_CANDIDATES: usize = 4096;
 
 /// One reuse candidate in logical token coordinates.
 ///
@@ -35,77 +29,4 @@ impl CandidateRange {
     pub fn destination_end(&self) -> Option<u32> {
         self.destination_start.checked_add(self.token_count)
     }
-}
-
-/// A validated candidate pool. It proves arithmetic and per-candidate shape
-/// only; it does not prove token equality, source extents or model-state
-/// equivalence. Discovery and native validation own those obligations.
-#[derive(Debug, Clone, Copy)]
-pub struct ValidatedPool<'a> {
-    candidates: &'a [CandidateRange],
-    k: u32,
-    scratch_bytes: u64,
-    reserved_bytes: u64,
-}
-
-impl<'a> ValidatedPool<'a> {
-    pub fn candidates(&self) -> &'a [CandidateRange] {
-        self.candidates
-    }
-
-    pub fn k(&self) -> u32 {
-        self.k
-    }
-
-    /// Modeled DP/table/plan payload bytes, excluding the stack reserve and
-    /// allocator or spare `Vec` capacity overhead.
-    pub fn scratch_bytes(&self) -> u64 {
-        self.scratch_bytes
-    }
-
-    /// Scratch plus stack reserve; native admits this before allocation.
-    pub fn reserved_bytes(&self) -> u64 {
-        self.reserved_bytes
-    }
-}
-
-/// Validate a candidate pool. Order is not significant and alternatives may
-/// conflict; the selector chooses between them later.
-pub fn validate_pool(
-    candidates: &[CandidateRange],
-    k: u32,
-) -> Result<ValidatedPool<'_>, ContractError> {
-    if candidates.len() > MAX_CANDIDATES {
-        return Err(ContractError::TooManyCandidates {
-            got: candidates.len(),
-            max: MAX_CANDIDATES,
-        });
-    }
-    if k == 0 || k > MAX_RANGES {
-        return Err(ContractError::InvalidK { k, max: MAX_RANGES });
-    }
-    for (index, range) in candidates.iter().enumerate() {
-        if range.token_count == 0 {
-            return Err(ContractError::ZeroCount { index });
-        }
-        if range.source_end().is_none() || range.destination_end().is_none() {
-            return Err(ContractError::OffsetOverflow { index });
-        }
-    }
-    let bytes = scratch_bytes(candidates.len(), k).ok_or(ContractError::ScratchExceedsLimit {
-        bytes: u64::MAX,
-        max: MAX_SCRATCH_BYTES,
-    })?;
-    if bytes > MAX_SCRATCH_BYTES {
-        return Err(ContractError::ScratchExceedsLimit {
-            bytes,
-            max: MAX_SCRATCH_BYTES,
-        });
-    }
-    Ok(ValidatedPool {
-        candidates,
-        k,
-        scratch_bytes: bytes,
-        reserved_bytes: bytes + STACK_RESERVE_BYTES,
-    })
 }

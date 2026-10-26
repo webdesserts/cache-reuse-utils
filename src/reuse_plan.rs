@@ -4,13 +4,16 @@ use crate::cache_view::CacheIdentity;
 use crate::candidate::{CandidateRange, MAX_RANGES};
 use crate::discovery::DiscoveryStatus;
 use crate::error::PlanGeometryError;
-use crate::placement::{
-    LossAllowance, PlacementMetrics, PlacementPolicy, PlacementRecipe, PlacementStatus,
-};
+use crate::placement::{PlacementMetrics, PlacementPolicy, PlacementRecipe, PlacementStatus};
 use crate::placement_search::PlacementOutcome;
 use crate::timing::AnalysisTiming;
 
 /// A selected reuse plan owned by the caller-facing result.
+///
+/// An empty plan is a deliberate complete no-reuse result. A non-empty plan
+/// carries logical ranges, the prepared placement recipe and the status that
+/// says how much exploration completed. The plan is stateless: it owns copied
+/// coordinates and metadata, not a native cache handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReusePlan {
     ranges: Vec<CandidateRange>,
@@ -66,7 +69,7 @@ impl ReusePlan {
             fresh_tokens,
             best_useful: outcome.best_useful,
             admissible_min,
-            loss_allowance: LossAllowance::new(allowance.basis_points()),
+            loss_allowance: allowance,
         };
         let placement = PlacementRecipe {
             cache_identity,
@@ -90,14 +93,17 @@ impl ReusePlan {
         })
     }
 
+    /// Final chosen ranges in original target/source coordinates.
     pub fn ranges(&self) -> &[CandidateRange] {
         &self.ranges
     }
 
+    /// Number of original target tokens covered by reused ranges.
     pub fn covered_tokens(&self) -> u64 {
         self.covered_tokens
     }
 
+    /// Cooperative stage timing for this analysis attempt.
     pub fn timing(&self) -> AnalysisTiming {
         self.timing
     }
@@ -119,16 +125,18 @@ impl ReusePlan {
         &self.placement
     }
 
+    /// Placement accounting and the useful-coverage floor used to select it.
     pub fn metrics(&self) -> PlacementMetrics {
         self.metrics
     }
 
+    /// Whether exploration completed or stopped at a declared bound.
     pub fn placement_status(&self) -> PlacementStatus {
         self.placement_status
     }
 }
 
-/// Validate a selected plan independently of how completely it was searched.
+/// Validate the selected-plan geometry produced by search.
 ///
 /// Rules: at most `K` ranges; ranges are ordered by destination then source;
 /// each is non-empty and representable without offset overflow; consecutive
@@ -136,7 +144,10 @@ impl ReusePlan {
 /// because the selector must emit coalesced final ranges. An empty plan is
 /// valid (explicit no-reuse output). This checks plan structure only: it has no
 /// extent parameters and does not prove token equality or native safety.
-pub fn validate_plan(plan: &[CandidateRange], k: u32) -> Result<(), PlanGeometryError> {
+///
+/// This is internal algorithm validation; caller-facing recipe validation is
+/// `PlacementRecipe::validate`.
+pub(crate) fn validate_plan(plan: &[CandidateRange], k: u32) -> Result<(), PlanGeometryError> {
     if k == 0 || k > MAX_RANGES {
         return Err(PlanGeometryError::TooManyRanges {
             got: plan.len(),
@@ -187,4 +198,47 @@ pub fn validate_plan(plan: &[CandidateRange], k: u32) -> Result<(), PlanGeometry
         previous = Some(range);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn range(source_start: u32, destination_start: u32, token_count: u32) -> CandidateRange {
+        CandidateRange {
+            source_start,
+            destination_start,
+            token_count,
+        }
+    }
+
+    #[test]
+    fn selected_plan_geometry_requires_order_disjointness_and_coalescing() {
+        assert!(validate_plan(&[], 2).is_ok());
+        assert!(validate_plan(&[range(0, 0, 4), range(8, 12, 3)], 2).is_ok());
+        assert!(matches!(
+            validate_plan(&[range(10, 0, 2), range(0, 3, 2)], 2),
+            Err(PlanGeometryError::CrossingOrOverlap { index: 1 })
+        ));
+        assert!(matches!(
+            validate_plan(&[range(10, 0, 2), range(3, 0, 2)], 2),
+            Err(PlanGeometryError::Misordered { index: 1 })
+        ));
+        assert!(matches!(
+            validate_plan(&[range(0, 0, 4), range(4, 4, 2)], 2),
+            Err(PlanGeometryError::AdjacentRanges { index: 1 })
+        ));
+        assert!(matches!(
+            validate_plan(&[range(0, 0, 1), range(2, 2, 1)], 1),
+            Err(PlanGeometryError::TooManyRanges { got: 2, max: 1 })
+        ));
+        assert!(matches!(
+            validate_plan(&[range(0, 0, 0)], 1),
+            Err(PlanGeometryError::InvalidRange { index: 0 })
+        ));
+        assert!(matches!(
+            validate_plan(&[range(u32::MAX, 0, 1)], 1),
+            Err(PlanGeometryError::OffsetOverflow { index: 0 })
+        ));
+    }
 }

@@ -9,10 +9,12 @@
 pub struct CacheIdentity(u64);
 
 impl CacheIdentity {
+    /// Create an opaque caller value. The planner only round-trips it.
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
 
+    /// Return the original caller value.
     pub const fn value(self) -> u64 {
         self.0
     }
@@ -32,7 +34,12 @@ impl CacheIdentity {
 /// the plan.
 #[derive(Debug, Clone, Copy)]
 pub struct CacheView<'a> {
+    /// Actual token IDs in cached positions. This slice is borrowed only for
+    /// the synchronous analysis call.
     pub tokens: &'a [u32],
+    /// Opaque binding metadata copied to every returned plan.
     pub identity: CacheIdentity,
+    /// Smallest qualifying exact contiguous match, in tokens. Must be nonzero;
+    /// a value longer than either input means no candidate can match.
     pub minimum_match_tokens: u32,
 }

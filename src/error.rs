@@ -1,19 +1,17 @@
-//! Public error types for candidate input, selected-plan geometry and analysis.
+//! Public analysis errors and internal selected-plan geometry checks.
 
 use crate::discovery::DiscoveryError;
 use crate::placement::{PlacementConfigError, PlacementStatus};
 use crate::placement_search::SearchError;
 use crate::timing::{AnalysisStage, AnalysisTiming};
 
-/// Why a candidate pool or analysis input was rejected. Only arithmetic and
-/// per-input shape are checked; candidates may compete and may appear in any
-/// order.
+/// Why an analysis input was rejected.
+///
+/// These are caller-visible preparation errors. Candidate-pool scratch/table
+/// validation used by the retired raw-pool model is internal and is not part of
+/// this analysis contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContractError {
-    TooManyCandidates {
-        got: usize,
-        max: usize,
-    },
     InvalidK {
         k: u32,
         max: u32,
@@ -22,28 +20,41 @@ pub enum ContractError {
     InvalidMinimum {
         minimum: u32,
     },
-    ZeroCount {
+}
+
+/// Why the planner's own selected output was rejected as internally
+/// inconsistent.
+///
+/// This is an internal invariant type, not a caller input-validation error.
+/// Callers that construct or modify a public `PlacementRecipe` use
+/// `PlacementMaterializeError::RecipeShape` and the other materialization
+/// variants instead. `InvalidPlacementRecipe` is produced only when the
+/// planner validates a recipe it just constructed; seeing it means a planner
+/// bug, so it is mapped to `PlanError::Invariant` and no plan is returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PlanGeometryError {
+    TooManyRanges {
+        got: usize,
+        max: u32,
+    },
+    InvalidRange {
         index: usize,
     },
     OffsetOverflow {
         index: usize,
     },
-    ScratchExceedsLimit {
-        bytes: u64,
-        max: u64,
+    Misordered {
+        index: usize,
     },
-}
-
-/// Why a selected plan was rejected. These are output properties: selected
-/// ranges must not cross, overlap or touch (touching ranges must be coalesced).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PlanGeometryError {
-    TooManyRanges { got: usize, max: u32 },
-    InvalidRange { index: usize },
-    OffsetOverflow { index: usize },
-    Misordered { index: usize },
-    CrossingOrOverlap { index: usize },
-    AdjacentRanges { index: usize },
+    CrossingOrOverlap {
+        index: usize,
+    },
+    AdjacentRanges {
+        index: usize,
+    },
+    /// The planner constructed a placement recipe that failed its own
+    /// structural validation. This is an internal invariant failure, not a
+    /// normal no-match, timeout or resource refusal.
     InvalidPlacementRecipe,
 }
 
@@ -122,6 +133,11 @@ pub enum PlanError {
         timing: AnalysisTiming,
     },
     /// An internal planning invariant failed; no plan may be used.
+    ///
+    /// This is not a caller policy error, no-match, timeout or resource
+    /// admission refusal. It means the planner produced output that failed its
+    /// own structural checks (for example an inconsistent placement recipe) and
+    /// should be reported as a bug.
     Invariant {
         reason: &'static str,
         stage: AnalysisStage,
@@ -229,6 +245,8 @@ pub(crate) fn geometry_reason(error: PlanGeometryError) -> &'static str {
         PlanGeometryError::Misordered { .. } => "selected ranges are misordered",
         PlanGeometryError::CrossingOrOverlap { .. } => "selected ranges cross or overlap",
         PlanGeometryError::AdjacentRanges { .. } => "adjacent selected ranges were not coalesced",
-        PlanGeometryError::InvalidPlacementRecipe => "placement recipe is inconsistent",
+        PlanGeometryError::InvalidPlacementRecipe => {
+            "internal planner produced an inconsistent placement recipe"
+        }
     }
 }

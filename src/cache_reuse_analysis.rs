@@ -13,20 +13,27 @@ use crate::timing::{AnalysisStage, AnalysisTiming, CheckOutcome, DeadlineClock, 
 
 /// One cache-reuse analysis request.
 ///
-/// This is the README entry point. Callers provide logical context tokens and
-/// one borrowed eligible cache source; discovery finds exact qualifying matches
-/// and the private selector chooses a legal plan. Native integration still owns
-/// projection, cache pinning, physical placement and execution proof.
+/// The call discovers exact qualifying matches in an actual-token cache view,
+/// then searches declared placement variants. It returns an owned plan or a
+/// typed refusal; it does not access engine cache state or execute inference.
 ///
 /// `deadline` is one absolute monotonic instant shared by preparation, discovery
-/// and search; it is not a per-stage budget. `cancel` is a whole-request stop
-/// that takes precedence over the deadline.
+/// and search. It is cooperative and is not a per-stage budget. `cancel` is a
+/// whole-request stop checked before deadline progress.
 pub struct CacheReuseAnalysis<'a> {
+    /// Original target token sequence to preserve.
     pub context_tokens: &'a [u32],
+    /// Borrowed cache source and its caller binding identity.
     pub cache: CacheView<'a>,
+    /// Maximum number of final coalesced reuse ranges; must be in
+    /// `1..=MAX_RANGES`.
     pub k: u32,
+    /// Absolute deadline for preparation, discovery and search.
     pub deadline: Instant,
+    /// Caller-owned whole-request cancellation callback. It is checked before
+    /// deadline progress at analysis checkpoints.
     pub cancel: &'a mut dyn FnMut() -> bool,
+    /// Declared placement domain and policy limits.
     pub placement: PlacementPolicy<'a>,
 }
 
@@ -36,8 +43,9 @@ impl<'a> CacheReuseAnalysis<'a> {
     ///
     /// Complete discovery with no qualifying match is a deliberate empty plan.
     /// A valid plan found before the deadline is returned even when the deadline
-    /// stopped further work. Incomplete discovery with no plan is an
-    /// informative error, never a fabricated empty plan. Cancellation wins.
+    /// stopped further work. With no incumbent, deadline exhaustion returns
+    /// [`PlanError::BudgetExhausted`], while variant/state exploration caps
+    /// return [`PlanError::PlacementIncomplete`]. Cancellation wins.
     pub fn analyze(self) -> Result<ReusePlan, PlanError> {
         let CacheReuseAnalysis {
             context_tokens,
@@ -341,7 +349,7 @@ mod tests {
             &[1, 2, 3],
             cache,
             1,
-            &PlacementPolicy::default_for(3),
+            &PlacementPolicy::without_padding(3),
             &mut clock,
         ) {
             Err(PlanError::AdmissionDenied {

@@ -33,7 +33,7 @@ fn analyze(
         k,
         deadline,
         cancel,
-        placement: PlacementPolicy::default_for(context.len()),
+        placement: PlacementPolicy::without_padding(context.len()),
     }
     .analyze()
 }

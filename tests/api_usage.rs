@@ -24,7 +24,7 @@ fn run(
         k,
         deadline: Instant::now() + Duration::from_secs(5),
         cancel: &mut cancel,
-        placement: PlacementPolicy::default_for(context.len()),
+        placement: PlacementPolicy::without_padding(context.len()),
     }
     .analyze()
 }
@@ -122,7 +122,7 @@ fn empty_inputs_are_deliberate_no_reuse_with_identity() {
         k: 1,
         deadline: past,
         cancel: &mut cancel,
-        placement: PlacementPolicy::default_for(0),
+        placement: PlacementPolicy::without_padding(0),
     }
     .analyze()
     .expect("no-work no-match is complete even past deadline");
@@ -170,7 +170,7 @@ fn cancellation_wins_before_discovery() {
         k: 1,
         deadline: Instant::now() + Duration::from_secs(5),
         cancel: &mut cancel,
-        placement: PlacementPolicy::default_for(3),
+        placement: PlacementPolicy::without_padding(3),
     }
     .analyze()
     .expect_err("cancelled");
@@ -215,7 +215,7 @@ fn inputs_beyond_the_supported_envelope_are_admission_errors() {
         k: 1,
         deadline: Instant::now() + Duration::from_secs(5),
         cancel: &mut cancel,
-        placement: PlacementPolicy::default_for(oversized.len()),
+        placement: PlacementPolicy::without_padding(oversized.len()),
     }
     .analyze()
     .expect_err("oversized context");
@@ -267,7 +267,7 @@ fn crafted_seed_order_does_not_exhaust_a_small_stack() {
                 k: 1,
                 deadline: Instant::now() + Duration::from_secs(10),
                 cancel: &mut cancel,
-                placement: PlacementPolicy::default_for(1),
+                placement: PlacementPolicy::without_padding(1),
             }
             .analyze()
         })
@@ -307,7 +307,7 @@ fn expiry_during_preparation_reports_budget_without_discovery_or_search() {
             .checked_sub(Duration::from_secs(1))
             .expect("past instant"),
         cancel: &mut cancel,
-        placement: PlacementPolicy::default_for(3),
+        placement: PlacementPolicy::without_padding(3),
     }
     .analyze()
     .expect_err("preparation deadline");

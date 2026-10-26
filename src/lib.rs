@@ -1,5 +1,4 @@
 #![doc = include_str!("../README.md")]
-#![doc = include_str!("../docs/current-api.md")]
 
 //! Bounded single-threaded selector for Suffix Cache Reuse.
 //!
@@ -25,17 +24,16 @@ pub mod test_support;
 
 pub use cache_reuse_analysis::CacheReuseAnalysis;
 pub use cache_view::{CacheIdentity, CacheView};
-pub use candidate::{
-    CandidateRange, MAX_CANDIDATES, MAX_RANGES, MAX_SCRATCH_BYTES, STACK_RESERVE_BYTES,
-    ValidatedPool, validate_pool,
-};
+// Public exports are limited to the analysis contract and configuration that a
+// caller or the C ABI adapter actually consumes. Dead raw-pool/scratch and
+// standalone plan-validation facades are not part of the public contract.
+pub use candidate::{CandidateRange, MAX_RANGES};
 pub use discovery::DiscoveryStatus;
-pub use error::{AdmissionDeniedReason, ContractError, InputSide, PlanError, PlanGeometryError};
+pub use error::{AdmissionDeniedReason, ContractError, InputSide, PlanError};
 pub use placement::{
-    DEFAULT_LOSS_BASIS_POINTS, Insertion, LossAllowance, MAX_NEW_PADDING, MAX_PLACEMENT_BYTES,
-    MAX_PLACEMENT_VARIANTS, PlacedRange, PlacementConfigError, PlacementMaterializeError,
-    PlacementMetrics, PlacementPolicy, PlacementPosition, PlacementRecipe, PlacementStatus,
+    Insertion, LossAllowance, MAX_NEW_PADDING, MAX_PLACEMENT_VARIANTS, PlacedRange,
+    PlacementConfigError, PlacementMaterializeError, PlacementMetrics, PlacementPolicy,
+    PlacementPosition, PlacementRecipe, PlacementStatus,
 };
-pub use placement_search::scratch_bytes;
-pub use reuse_plan::{ReusePlan, validate_plan};
+pub use reuse_plan::ReusePlan;
 pub use timing::{AnalysisStage, AnalysisTiming};
