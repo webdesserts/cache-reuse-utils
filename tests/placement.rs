@@ -1,6 +1,6 @@
 //! Public stateless placement API tests.
 
-use scr_planner::{
+use cache_reuse_utils::{
     AnalysisStage, CacheIdentity, CacheReuseAnalysis, CacheView, LossAllowance,
     PlacementConfigError, PlacementPolicy, PlacementStatus, PlanError, ReusePlan,
 };
@@ -250,7 +250,7 @@ fn supports_exactly_ten_selected_ranges_and_rejects_eleven() {
     assert!(matches!(
         error,
         PlanError::InvalidInput {
-            reason: scr_planner::ContractError::InvalidK { k: 11, max: 10 },
+            reason: cache_reuse_utils::ContractError::InvalidK { k: 11, max: 10 },
             stage: AnalysisStage::Preparation,
             ..
         }

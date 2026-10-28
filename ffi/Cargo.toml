@@ -1,0 +1,14 @@
+[package]
+name = "cache-reuse-utils-ffi"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "Model-independent C ABI for cache-reuse-utils"
+
+[lib]
+name = "cache_reuse_utils_ffi"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+cache-reuse-utils = { path = ".." }

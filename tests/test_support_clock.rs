@@ -3,12 +3,12 @@
 //! Public integration tests for the opt-in clock bridge. These compile only
 //! when `test-support` is enabled and exercise the ordinary public API.
 
-use mock_instant::thread_local::MockClock;
-use scr_planner::test_support::MockClockGuard;
-use scr_planner::{
+use cache_reuse_utils::test_support::MockClockGuard;
+use cache_reuse_utils::{
     AnalysisStage, CacheIdentity, CacheReuseAnalysis, CacheView, PlacementPolicy, PlanError,
     ReusePlan,
 };
+use mock_instant::thread_local::MockClock;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 

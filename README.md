@@ -1,14 +1,14 @@
-# scr-planner
+# cache-reuse-utils
 
 Safe Rust planning for Suffix Cache Reuse (SCR). Given a target token sequence and
-one borrowed cache of actual token IDs, `scr-planner` finds exact qualifying
+one borrowed cache of actual token IDs, `cache-reuse-utils` finds exact qualifying
 matches, chooses a bounded placement, and returns an owned plan and recipe. The
 engine adapter owns cache state, physical placement and execution.
 
 ## Quickstart
 
 ```rust
-# use scr_planner::{CacheIdentity, CacheReuseAnalysis, CacheView, PlacementPolicy, PlanError, ReusePlan};
+# use cache_reuse_utils::{CacheIdentity, CacheReuseAnalysis, CacheView, PlacementPolicy, PlanError, ReusePlan};
 # use std::time::{Duration, Instant};
 fn analyze_reuse(target: &[u32], cache: &[u32]) -> Result<ReusePlan, PlanError> {
     let mut cancel = || false; // caller-owned cancellation
@@ -51,6 +51,57 @@ prepared_capacity)` enables caller-owned insertion. Both start at neutral
 alignment 1. `PlacementRecipe::materialize` builds the prepared target token
 buffer and checks reused-token equality against the borrowed source; it does not
 install native cache tensors or execute inference.
+
+## C ABI
+
+The separate `ffi/` package is the model-independent C ABI boundary. It owns the
+`cache_reuse_utils_ffi` static library and uses the existing `scr_planner_*` C
+symbols and numeric status values. The canonical generated header is
+`ffi/include/cache_reuse_utils.h`; `scr_planner_ffi.h` is a compatibility
+include. Normal Rust and C builds do not require cbindgen.
+
+This is one Cargo workspace with the safe core as its default member and the FFI
+crate as an explicit member. The workspace release profile uses
+`panic = "unwind"` so the FFI's `catch_unwind` boundary remains effective. Build
+and test the FFI explicitly:
+
+```sh
+cargo test --locked -p cache-reuse-utils-ffi
+cargo build --release --locked -p cache-reuse-utils-ffi \
+  --target-dir /absolute/owned/target
+./ffi/tests/run-c-tests.sh /absolute/owned/target
+```
+
+`run-c-tests.sh` defaults to the workspace target at `<repo>/target`, and always
+builds and links the archive under the target directory passed as its first
+argument (or `CARGO_TARGET_DIR`). It does not fall back to any other archive. Link a C
+consumer with the canonical include path and the archive:
+
+```sh
+cc -std=c11 -Iffi/include consumer.c \
+  /absolute/owned/target/release/libcache_reuse_utils_ffi.a -lpthread -ldl -lm
+```
+
+A downstream Cargo consumer's **root** manifest controls profiles for Git
+dependencies. This workspace's release unwind setting does not force a
+consumer's dependency build to unwind. A consumer that relies on the C ABI
+`catch_unwind` boundary, including the native static-library shim, must set
+`[profile.release] panic = "unwind"` in its root profile (or otherwise verify the
+effective profile).
+
+The call contract is the existing one: input and source arrays are `int32_t`
+tokens with accompanying lengths; null input pointers are accepted only for zero
+lengths; config and result must be valid aligned pointers; cancellation is an
+optional C callback and must not unwind; pointers are not retained after the
+call. The function returns 0 for a produced plan, including an empty or partial
+plan, and nonzero otherwise. On the early null `config`/`result` rejection the
+function returns 1 and writes a best-effort error, but cannot promise a populated
+`result.status`. Error buffers are best effort. This package adds no aliasing,
+thread-reentrancy, or broader ownership guarantee.
+
+`ffi/include/scr_planner_ffi.h` is only a compatibility include. The optional
+`tools/check-header.sh` requires cbindgen 0.29.4 and checks the canonical header
+against a temporary generation; it is not part of ordinary builds.
 
 ## Engine boundary
 

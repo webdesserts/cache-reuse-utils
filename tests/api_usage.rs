@@ -1,6 +1,6 @@
 //! Public full-analysis API tests: context + borrowed cache -> owned plan.
 
-use scr_planner::{
+use cache_reuse_utils::{
     AdmissionDeniedReason, AnalysisStage, CacheIdentity, CacheReuseAnalysis, CacheView,
     ContractError, DiscoveryStatus, InputSide, PlacementPolicy, PlanError, ReusePlan,
 };
@@ -33,8 +33,8 @@ fn range(
     source_start: u32,
     destination_start: u32,
     token_count: u32,
-) -> scr_planner::CandidateRange {
-    scr_planner::CandidateRange {
+) -> cache_reuse_utils::CandidateRange {
+    cache_reuse_utils::CandidateRange {
         source_start,
         destination_start,
         token_count,

@@ -1,4 +1,4 @@
-# scr-planner
+# cache-reuse-utils
 
 - Review scope: keep commits small and explain the contract they change.
 - Prefer API-level integration tests under `tests/` (how a caller uses the
@@ -17,5 +17,6 @@
 - Keep the default production crate `std`-only, no `unsafe`, no retained C
   pointers or session ownership; native state stays in Dwarfstar. The optional,
   explicitly authorized `test-support` feature may use the pinned
-  `mock_instant` test dependency; it must never be enabled by default.
+  `mock_instant` test dependency; it must never be enabled by default. The
+  separate `ffi` crate is the only authorized unsafe/C ABI boundary.
 - Comments and commits are reviewed by Michael before further work.

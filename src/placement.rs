@@ -16,7 +16,7 @@ use crate::cache_view::CacheIdentity;
 /// policy validation during analysis, not silently clamped.
 ///
 /// ```
-/// # use scr_planner::LossAllowance;
+/// # use cache_reuse_utils::LossAllowance;
 /// let ten_percent = LossAllowance::from_percent(10);
 /// assert_eq!(ten_percent, LossAllowance::from_basis_points(1_000));
 /// assert_eq!(ten_percent.basis_points(), 1_000);
@@ -185,7 +185,7 @@ impl<'a> PlacementPolicy<'a> {
     /// analysis.
     ///
     /// ```
-    /// # use scr_planner::PlacementPolicy;
+    /// # use cache_reuse_utils::PlacementPolicy;
     /// let policy = PlacementPolicy::with_padding(10, 99, &[0, 1], 11);
     /// assert_eq!(policy.pad_token, Some(99));
     /// assert_eq!(policy.max_new_padding, 1);
@@ -466,7 +466,7 @@ impl PlacementRecipe {
     /// tensors are separate. That is not a total peak-memory or RSS claim.
     ///
     /// ```
-    /// # use scr_planner::{CacheIdentity, Insertion, PlacedRange, PlacementRecipe};
+    /// # use cache_reuse_utils::{CacheIdentity, Insertion, PlacedRange, PlacementRecipe};
     /// let recipe = PlacementRecipe {
     ///     cache_identity: CacheIdentity::new(1),
     ///     original_tokens: 4,
