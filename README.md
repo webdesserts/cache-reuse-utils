@@ -21,7 +21,7 @@ fn analyze_reuse(target: &[u32], cache: &[u32]) -> Result<ReusePlan, PlanError> 
             identity: CacheIdentity::new(7),
             minimum_match_tokens: 4,
         },
-        k: 10, // maximum final reused ranges
+        k: 10, // maximum final reused ranges, up to MAX_RANGES (32)
         deadline: Instant::now() + Duration::from_secs(5),
         cancel: &mut cancel,
         placement: PlacementPolicy::without_padding(target.len()),
@@ -76,10 +76,35 @@ two ways to align it:
 
 Because inserting pad tokens mutates the prompt, each inserted pad token carries
 a coverage penalty during selection (`pad_penalty_tokens`, which defaults to 16
-tokens). Among all plans whose total coverage falls within the configured
+tokens). Trimming never changes the prompt, so with the default the planner
+pads only when one pad run realigns many later ranges at once, or when a
+match cannot be trimmed.
+
+### How many ranges to use
+
+A plan may use up to `k` ranges, and `k` can be as high as `MAX_RANGES` (32),
+enough for a prompt made of many unchanged blocks. Each range is a separate
+reuse step for the engine, though, so a range should earn its place. Every
+range after the first costs `range_penalty_tokens` (32 by default) during
+selection. A plan that splits into nine more ranges to cover 15 more tokens
+loses to the simpler plan, while a range that brings back a whole block of
+hundreds of tokens is always worth it. The first range is free, so a single
+short match is never rejected just for being one range.
+
+### Choosing a plan
+
+Among all plans whose total coverage falls within the configured
 `LossAllowance` (10% by default) of the maximum raw coverage found, the planner
-chooses the plan with the highest **net coverage**
-(`covered_tokens - inserted_padding * pad_penalty_tokens`).
+chooses the plan with the highest **net coverage**:
+
+```text
+covered_tokens
+  - inserted_padding * pad_penalty_tokens
+  - (ranges - 1) * range_penalty_tokens
+```
+
+The penalties only choose between plans inside the allowance. With a zero
+allowance, the plan with the most coverage is required whatever its cost.
 
 `PlacementRecipe::materialize` constructs the prepared token buffer and verifies
 that every reused span matches the original target tokens; it never touches
@@ -138,6 +163,10 @@ a downstream Rust crate links `cache-reuse-utils-ffi` and relies on its
   in `result->status` and a NUL-terminated message in `error`.
 - Setting `pad_penalty_tokens = 0` in `CacheReuseConfig` selects the default
   penalty (`16`) whenever padding is enabled.
+- Setting `range_penalty_tokens = 0` selects the default range penalty (`32`).
+  Use `1` for the smallest penalty.
+- `max_ranges` accepts `1..=CACHE_REUSE_MAX_RANGES` (32). The result holds up
+  to 32 ranges and 32 insertions, about 1 KiB, so it still fits on the stack.
 
 To verify that `ffi/include/cache_reuse_utils.h` matches the Rust definitions
 (requires `cbindgen` 0.29.4; writes to a temporary file without touching the

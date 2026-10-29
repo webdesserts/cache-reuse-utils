@@ -144,6 +144,54 @@ fn search_matches_an_exhaustive_oracle_without_padding() {
     }
 }
 
+/// The selected plan has the best coverage net of the range penalty among
+/// plans within the loss allowance. For each range count `r`, the best plan
+/// with at most `r` ranges is the oracle's coverage for `r`; the optimum net
+/// is the best of those.
+#[test]
+fn range_penalty_selection_matches_an_exhaustive_oracle() {
+    let mut rng = Rng(17);
+    for case in 0..400 {
+        let context = rng.tokens(10, 3);
+        let cache = rng.tokens(10, 3);
+        let k = 1 + rng.below(4) as usize;
+        let penalty = [0, 1, 2, 3, 5][rng.below(5) as usize];
+        let loss = [0, 10, 30, 100][rng.below(4) as usize];
+        let mut policy = PlacementPolicy::without_padding(context.len());
+        policy.loss_allowance = LossAllowance::from_percent(loss);
+        policy.range_penalty_tokens = penalty;
+        let plan = analyze(&context, &cache, k as u32, policy);
+
+        let window = (0, context.len());
+        let best: Vec<u64> = (1..=k)
+            .map(|r| best_coverage(&cache, &context, window, r, ANY_START))
+            .collect();
+        let floor = best[k - 1] - best[k - 1] * loss as u64 / 100;
+        let net = |covered: u64, ranges: usize| {
+            covered as i64 - ranges.saturating_sub(1) as i64 * penalty as i64
+        };
+        let optimum = (1..=k)
+            .filter(|&r| best[r - 1] >= floor)
+            .map(|r| net(best[r - 1], r))
+            .max()
+            .unwrap_or(0);
+        let message = format!(
+            "case {case}: context {context:?} cache {cache:?} k {k} penalty {penalty} loss {loss}"
+        );
+        if floor == 0 && optimum <= 0 {
+            assert!(plan.ranges().is_empty(), "{message}");
+        } else {
+            assert!(plan.covered_tokens() >= floor, "{message}");
+            assert_eq!(
+                net(plan.covered_tokens(), plan.ranges().len()),
+                optimum,
+                "{message}"
+            );
+        }
+        assert_eq!(plan.metrics().best_useful, best[k - 1], "{message}");
+    }
+}
+
 /// Without padding, an unaligned match is left-trimmed to an aligned start.
 /// A single range is then exactly the best aligned sub-range. Several ranges
 /// may need a right trim the search does not make, so for them the oracle

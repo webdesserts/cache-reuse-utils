@@ -17,7 +17,13 @@
 //!    overlapping predecessors are visited from ordered end-coordinate maps.
 //! 4. **Plan selection:** Among completed plans within the policy's
 //!    [`crate::LossAllowance`] of the best raw coverage, choose the plan that
-//!    maximizes `covered - padding * pad_penalty_tokens`.
+//!    maximizes `covered - padding * pad_penalty_tokens -
+//!    (ranges - 1) * range_penalty_tokens`.
+//!
+//! Two exact prunings keep high `k` cheap. Labels for one variant with the
+//! same padding and ends keep only those that trade more ranges for strictly
+//! more coverage. A label whose reachable coverage (see [`bound`]) is below
+//! the loss floor of the best coverage so far is dropped.
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -27,13 +33,17 @@ use crate::error::PlanErrorKind;
 use crate::placement::{Insertion, PlacedRange, PlacementPolicy, PlacementStatus};
 use crate::timing::{Stop, Stopper};
 
+mod bound;
 mod index;
 
+use bound::Bound;
 use index::{Entry, Index};
 
-/// Cap on retained plan labels. A label is a few dozen bytes, so this bounds
-/// search memory to a few MiB.
-pub(crate) const MAX_STATES: usize = 1 << 16;
+/// Cap on retained plan labels. A label is 48 bytes, so labels take at most
+/// 12 MiB; their index entries add a few times that in the worst case. At
+/// `k = 32` a full search over 4,096 short repeated matches needs more than
+/// 2^16 labels, so the cap is 2^18.
+pub(crate) const MAX_STATES: usize = 1 << 18;
 
 const NO_PARENT: u32 = u32::MAX;
 
@@ -294,10 +304,14 @@ impl Search<'_> {
         })
     }
 
-    /// Coverage net of the pad penalty, the first selection criterion.
-    fn net(&self, label: &Label) -> u64 {
-        let penalty = label.padding as u64 * self.policy.pad_penalty_tokens as u64;
-        label.covered.saturating_sub(penalty)
+    /// Coverage net of the pad and range penalties, the first selection
+    /// criterion. The first range is free. Every term is far below `i64`
+    /// limits: coverage is under 2^20 and each penalty product under 2^45.
+    fn net(&self, label: &Label) -> i64 {
+        let pads = label.padding as i64 * self.policy.pad_penalty_tokens as i64;
+        let splits =
+            label.ranges.saturating_sub(1) as i64 * self.policy.range_penalty_tokens as i64;
+        label.covered as i64 - pads - splits
     }
 
     /// Labels for `chain` (variant indexes in destination-end order), appended
@@ -448,29 +462,58 @@ impl Search<'_> {
         let seeded = self.seed_greedy(variants, stopper);
         self.index_from(&mut index, 0);
         seeded?;
-        // (ranges, padding, destination end, source end) -> index in `fresh`.
-        let mut slots: HashMap<(u32, u32, u32, u32), usize> = HashMap::new();
-        let mut fresh: Vec<Label> = Vec::new();
+        let window_end = self.context_len as u32 - self.policy.fresh_suffix_tokens;
+        let ends = variants
+            .iter()
+            .map(|v| (v.destination_end(), v.token_count));
+        let bound = Bound::new(ends, self.k, window_end);
+        let mut best = self
+            .labels
+            .iter()
+            .map(|label| label.covered)
+            .max()
+            .unwrap_or(0);
+        // (padding, destination end, source end) -> slots in `fresh`. A label
+        // with no more ranges and at least the coverage of another with the
+        // same key extends to at least as good a plan, so each key keeps only
+        // labels that trade more ranges for strictly more coverage.
+        let mut slots: HashMap<(u32, u32, u32), Vec<usize>> = HashMap::new();
+        let mut fresh: Vec<Option<Label>> = Vec::new();
         for &variant in variants {
             if self.limit_status == Some(PlacementStatus::StateLimitReached) {
                 return Ok(());
             }
             slots.clear();
+            let floor = self.policy.loss_allowance.floor(best);
             let mut offer = |label: Label| {
+                let end = label.piece.destination_end();
+                if bound.reachable(end, label.ranges, label.covered) < floor {
+                    return;
+                }
                 let key = (
-                    label.ranges,
                     label.padding,
                     label.piece.destination_end(),
                     label.piece.source_end(),
                 );
-                match slots.get(&key) {
-                    Some(&slot) if fresh[slot].covered >= label.covered => {}
-                    Some(&slot) => fresh[slot] = label,
-                    None => {
-                        slots.insert(key, fresh.len());
-                        fresh.push(label);
-                    }
+                let front = slots.entry(key).or_default();
+                let kept = |slot: &usize| fresh[*slot].expect("front slots are live");
+                if front
+                    .iter()
+                    .map(kept)
+                    .any(|other| other.ranges <= label.ranges && other.covered >= label.covered)
+                {
+                    return;
                 }
+                front.retain(|&slot| {
+                    let other = fresh[slot].expect("front slots are live");
+                    let dominated = other.ranges >= label.ranges && other.covered <= label.covered;
+                    if dominated {
+                        fresh[slot] = None;
+                    }
+                    !dominated
+                });
+                front.push(fresh.len());
+                fresh.push(Some(label));
             };
             let mut stop = stopper.tick().err();
             if stop.is_none() {
@@ -480,12 +523,16 @@ impl Search<'_> {
                 stop = self.extend(&index, variant, stopper, &mut offer).err();
             }
             let room = self.max_states.saturating_sub(self.labels.len());
-            if fresh.len() > room {
-                fresh.truncate(room);
+            let first_new = self.labels.len();
+            let live = fresh.drain(..).flatten();
+            self.labels.extend(live.take(room.saturating_add(1)));
+            if self.labels.len() > first_new + room {
+                self.labels.truncate(first_new + room);
                 self.limit_status = Some(PlacementStatus::StateLimitReached);
             }
-            let first_new = self.labels.len();
-            self.labels.append(&mut fresh);
+            for label in &self.labels[first_new..] {
+                best = best.max(label.covered);
+            }
             self.index_from(&mut index, first_new);
             match stop {
                 Some(Stop::Cancelled) => return Err(Stop::Cancelled),
@@ -537,7 +584,8 @@ impl Search<'_> {
 
     /// Pick the plan to return. Eligible plans cover at least the loss floor
     /// of the best coverage. Among them, prefer the most coverage net of the
-    /// pad penalty, then less padding, more coverage and fewer ranges.
+    /// pad and range penalties, then less padding, more coverage and fewer
+    /// ranges.
     fn select(self) -> Result<PlacementOutcome, PlanErrorKind> {
         let status = if self.stopped_for_deadline {
             PlacementStatus::DeadlinePartial
@@ -552,10 +600,9 @@ impl Search<'_> {
             };
         };
         let admissible_min = self.policy.loss_allowance.floor(best_useful);
-        let penalty = |label: &Label| label.padding as u64 * self.policy.pad_penalty_tokens as u64;
         let rank = |label: &Label| {
             (
-                label.covered.saturating_sub(penalty(label)),
+                self.net(label),
                 Reverse(label.padding),
                 label.covered,
                 Reverse(label.ranges),
@@ -571,7 +618,7 @@ impl Search<'_> {
         }
         let index = selected.ok_or(PlanErrorKind::Invariant("best plan is not eligible"))?;
         let label = self.labels[index];
-        if admissible_min == 0 && label.covered <= penalty(&label) {
+        if admissible_min == 0 && self.net(&label) <= 0 {
             return Ok(PlacementOutcome::empty(best_useful, status));
         }
         let (plan, insertions) = self.reconstruct(index);

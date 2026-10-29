@@ -2,8 +2,8 @@
 
 use cache_reuse_utils::{
     AllowedInsertions, AnalysisStage, CacheIdentity, CacheReuseAnalysis, CacheView, ContractError,
-    DiscoveryStatus, LossAllowance, PlacementConfigError, PlacementPolicy, PlacementStatus,
-    PlanError, PlanErrorKind, ReusePlan,
+    DiscoveryStatus, LossAllowance, MAX_RANGES, PlacementConfigError, PlacementPolicy,
+    PlacementStatus, PlanError, PlanErrorKind, ReusePlan,
 };
 use std::time::{Duration, Instant};
 
@@ -118,6 +118,69 @@ fn full_allowance_prefers_no_reuse_to_an_expensive_pad() {
     let plan = analyze(&CONTEXT, &CACHE, 6, 1, policy).unwrap();
     assert!(plan.ranges().is_empty());
     assert_eq!(plan.metrics().best_useful, 6);
+}
+
+/// `blocks` distinct blocks of `len` tokens, in the same order in both
+/// sequences, separated by edits of different lengths so each block sits on
+/// its own diagonal. Block `i` is followed by `strays[i]` tokens shared by
+/// both edits.
+fn moved_blocks(blocks: u32, len: u32, strays: &[u32]) -> (Vec<u32>, Vec<u32>) {
+    let (mut context, mut cache) = (Vec::new(), Vec::new());
+    for block in 0..blocks {
+        let tokens = (block * 1000..block * 1000 + len).collect::<Vec<_>>();
+        context.extend(&tokens);
+        cache.extend(&tokens);
+        let stray = strays.get(block as usize).copied().unwrap_or(0);
+        let shared: Vec<u32> = (0..stray).map(|t| 500_000 + block * 100 + t).collect();
+        context.push(900_000 + block);
+        context.extend(&shared);
+        context.push(910_000 + block);
+        cache.extend([800_000 + block, 810_000 + block]);
+        cache.extend(&shared);
+        cache.push(820_000 + block);
+    }
+    (context, cache)
+}
+
+#[test]
+fn up_to_32_ranges_reuse_many_moved_blocks() {
+    let (context, cache) = moved_blocks(20, 40, &[]);
+    let plan = analyze(
+        &context,
+        &cache,
+        4,
+        MAX_RANGES,
+        PlacementPolicy::without_padding(context.len()),
+    )
+    .unwrap();
+    assert_eq!(plan.ranges().len(), 20);
+    assert_eq!(plan.covered_tokens(), 800);
+    assert_eq!(plan.placement_status(), PlacementStatus::Complete);
+}
+
+#[test]
+fn each_extra_range_must_cover_more_than_the_range_penalty() {
+    // Three 100-token blocks; each edit after the first two shares a
+    // 5-token stray phrase with the cache.
+    let (context, cache) = moved_blocks(3, 100, &[5, 5]);
+    let mut policy = PlacementPolicy::without_padding(context.len());
+    let plan = analyze(&context, &cache, 4, 8, policy).unwrap();
+    assert_eq!((plan.ranges().len(), plan.covered_tokens()), (3, 300));
+    assert_eq!(plan.metrics().best_useful, 310);
+    // Cheap ranges make the strays worth their slots.
+    policy.range_penalty_tokens = 4;
+    let plan = analyze(&context, &cache, 4, 8, policy).unwrap();
+    assert_eq!((plan.ranges().len(), plan.covered_tokens()), (5, 310));
+}
+
+#[test]
+fn the_first_range_is_free() {
+    // Six tokens are fewer than one range penalty, but a single range is
+    // never charged, even when the full allowance permits an empty plan.
+    let mut policy = PlacementPolicy::without_padding(CONTEXT.len());
+    policy.loss_allowance = LossAllowance::from_percent(100);
+    let plan = analyze(&CONTEXT, &CACHE, 4, 1, policy).unwrap();
+    assert_eq!(plan.covered_tokens(), 6);
 }
 
 #[test]
@@ -237,16 +300,24 @@ fn prepared_capacity_is_cumulative_across_gaps() {
 }
 
 #[test]
-fn ten_ranges_are_supported_and_eleven_rejected() {
-    let context: Vec<u32> = (10..20).flat_map(|t| [t, 0]).collect();
-    let cache: Vec<u32> = (10..20).flat_map(|t| [t, 99]).collect();
+fn max_ranges_are_supported_and_one_more_is_rejected() {
+    let blocks = 100..100 + MAX_RANGES;
+    let context: Vec<u32> = blocks.clone().flat_map(|t| [t, 0]).collect();
+    let cache: Vec<u32> = blocks.flat_map(|t| [t, 99]).collect();
     let mut policy = PlacementPolicy::without_padding(context.len());
+    // With no loss allowance the best coverage is mandatory, whatever the
+    // range penalty.
     policy.loss_allowance = LossAllowance::from_percent(0);
-    let plan = analyze(&context, &cache, 1, 10, policy).unwrap();
-    assert_eq!(plan.ranges().len(), 10);
+    let plan = analyze(&context, &cache, 1, MAX_RANGES, policy).unwrap();
+    assert_eq!(plan.ranges().len(), MAX_RANGES as usize);
     assert_eq!(
-        analyze(&context, &cache, 1, 11, policy).unwrap_err().kind,
-        PlanErrorKind::InvalidInput(ContractError::InvalidK { k: 11, max: 10 })
+        analyze(&context, &cache, 1, MAX_RANGES + 1, policy)
+            .unwrap_err()
+            .kind,
+        PlanErrorKind::InvalidInput(ContractError::InvalidK {
+            k: MAX_RANGES + 1,
+            max: MAX_RANGES
+        })
     );
 }
 

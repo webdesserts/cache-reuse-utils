@@ -27,9 +27,9 @@
 
 #define CACHE_REUSE_ERR_PANIC 14
 
-#define CACHE_REUSE_MAX_RANGES 10
+#define CACHE_REUSE_MAX_RANGES 32
 
-#define CACHE_REUSE_MAX_INSERTIONS 10
+#define CACHE_REUSE_MAX_INSERTIONS 32
 
 typedef struct {
   uint32_t max_ranges;
@@ -53,6 +53,7 @@ typedef struct {
   const uint32_t *allowed_insertions;
   uint32_t allowed_insertion_count;
   uint32_t pad_penalty_tokens;
+  uint32_t range_penalty_tokens;
 } cache_reuse_config;
 
 typedef struct {

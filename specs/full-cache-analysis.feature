@@ -46,6 +46,19 @@ Feature: Full cache-reuse analysis
     When the pad penalty for the inserted padding exceeds the coverage difference
     Then analysis selects the unpadded plan
 
+  Scenario: Up to 32 ranges reuse a prompt made of many unchanged blocks
+    Given a prompt in which 20 unchanged blocks each moved to a different offset
+    When analysis runs with K of 32
+    Then the plan reuses every block as its own range
+
+  Scenario: Each extra range must earn its place within the loss allowance
+    Given a plan that reuses a few long blocks
+    And a plan that also reuses several short stray matches between them
+    And both plans are within the loss allowance of the best coverage
+    When the extra ranges cover fewer tokens than the range penalty charges for them
+    Then analysis selects the plan with fewer ranges
+    But a single short match is never rejected for being a range, because the first range is free
+
   Scenario: An unaligned match can be left-trimmed instead of padded
     Given a match whose prepared target start is not aligned
     When analysis runs
@@ -71,6 +84,6 @@ Feature: Full cache-reuse analysis
     Then analysis returns a Cancelled error and discards any partial plan
 
   Scenario: Invalid requests are rejected during preparation
-    Given K outside 1..=10, a zero minimum match length, an invalid placement policy, or an oversized input
+    Given K outside 1..=32, a zero minimum match length, an invalid placement policy, or an oversized input
     When analysis runs
     Then analysis fails at the Preparation stage with a typed validation or admission error

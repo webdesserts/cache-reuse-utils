@@ -84,7 +84,23 @@ pub const MAX_PLACEMENT_VARIANTS: usize = 4096;
 pub const MAX_NEW_PADDING: u32 = 4096;
 
 /// Default `pad_penalty_tokens` for [`PlacementPolicy::with_padding`].
+///
+/// A pad changes the prompt the model sees, while trimming a range only
+/// costs prefill. Padding a misaligned range by `n` tokens and trimming it by
+/// `n` tokens fix the same misalignment, so with this default a pad run is
+/// chosen only when it realigns many later ranges at once, or when trimming
+/// is not possible.
 pub const DEFAULT_PAD_PENALTY_TOKENS: u32 = 16;
+
+/// Default `range_penalty_tokens` for both policy constructors.
+///
+/// Each range after the first is a separate reuse step for the engine and
+/// splits the fresh prefill around it, but it never changes the prompt. With
+/// this default, a range shorter than about 32 tokens is only kept when the
+/// loss allowance requires its coverage. That drops short coincidental
+/// phrase matches while leaving real cached blocks alone. Engines with a
+/// measured per-range cost should set their own value.
+pub const DEFAULT_RANGE_PENALTY_TOKENS: u32 = 32;
 
 /// Original-target boundaries where this call may insert padding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,9 +144,12 @@ pub struct PlacementPolicy<'a> {
     pub allowed_insertions: AllowedInsertions<'a>,
     /// Model-visible token for this call's insertions. `None` forbids padding.
     pub pad_token: Option<u32>,
-    /// Covered tokens one inserted pad must buy back. Selection maximizes
-    /// `covered - padding * pad_penalty_tokens` among eligible plans.
+    /// Covered tokens one inserted pad must buy back in plan selection.
     pub pad_penalty_tokens: u32,
+    /// Covered tokens each range after the first must buy back in plan
+    /// selection. The first range is free, so a single match is never
+    /// rejected for its own sake.
+    pub range_penalty_tokens: u32,
     /// Required alignment of source-range starts.
     pub source_start_alignment: u32,
     /// Required alignment of prepared-target range starts.
@@ -159,7 +178,16 @@ impl<'a> PlacementPolicy<'a> {
     /// Construct a no-padding policy for `context_len`.
     ///
     /// It forbids insertions and caps prepared tokens at the original target
-    /// length. Alignments are one and no extra trims are tried.
+    /// length. Alignments are one and no extra trims are tried. Each range
+    /// after the first costs [`DEFAULT_RANGE_PENALTY_TOKENS`] covered tokens
+    /// in selection.
+    ///
+    /// ```
+    /// # use cache_reuse_utils::PlacementPolicy;
+    /// let policy = PlacementPolicy::without_padding(10);
+    /// assert_eq!(policy.pad_token, None);
+    /// assert_eq!(policy.range_penalty_tokens, 32);
+    /// ```
     pub fn without_padding(context_len: usize) -> Self {
         Self {
             loss_allowance: LossAllowance::default(),
@@ -168,6 +196,7 @@ impl<'a> PlacementPolicy<'a> {
             allowed_insertions: AllowedInsertions::Boundaries(&[]),
             pad_token: None,
             pad_penalty_tokens: 0,
+            range_penalty_tokens: DEFAULT_RANGE_PENALTY_TOKENS,
             source_start_alignment: 1,
             prepared_target_start_alignment: 1,
             reuse_count_alignment: 1,
@@ -186,7 +215,8 @@ impl<'a> PlacementPolicy<'a> {
     /// `prepared_capacity` is the total original-target-plus-padding capacity;
     /// `max_new_padding` is the spare capacity, capped by [`MAX_NEW_PADDING`].
     /// Each pad costs [`DEFAULT_PAD_PENALTY_TOKENS`] covered tokens in
-    /// selection. Alignments start at 1; set the fields a model requires.
+    /// selection, and ranges cost the same as in [`Self::without_padding`].
+    /// Alignments start at 1; set the fields a model requires.
     /// Invalid capacity or boundaries are rejected during analysis.
     ///
     /// ```

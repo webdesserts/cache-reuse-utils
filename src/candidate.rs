@@ -2,7 +2,7 @@
 
 /// Maximum number of final reused ranges a plan may contain (the largest
 /// accepted `k`).
-pub const MAX_RANGES: u32 = 10;
+pub const MAX_RANGES: u32 = 32;
 /// Maximum number of discovered candidate matches retained for search.
 pub(crate) const MAX_CANDIDATES: usize = 4096;
 

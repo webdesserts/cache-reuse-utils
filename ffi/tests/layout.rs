@@ -24,7 +24,7 @@ fn c_abi_layout_matches_expected_darwin_arm64_shape() {
     assert_eq!(offset_of!(CacheReuseInsertion, token), 4);
     assert_eq!(offset_of!(CacheReuseInsertion, count), 8);
 
-    assert_eq!(size_of::<CacheReuseConfig>(), 88);
+    assert_eq!(size_of::<CacheReuseConfig>(), 96);
     assert_eq!(align_of::<CacheReuseConfig>(), 8);
     assert_eq!(offset_of!(CacheReuseConfig, max_ranges), 0);
     assert_eq!(offset_of!(CacheReuseConfig, minimum_match_tokens), 4);
@@ -56,8 +56,9 @@ fn c_abi_layout_matches_expected_darwin_arm64_shape() {
     assert_eq!(offset_of!(CacheReuseConfig, allowed_insertions), 72);
     assert_eq!(offset_of!(CacheReuseConfig, allowed_insertion_count), 80);
     assert_eq!(offset_of!(CacheReuseConfig, pad_penalty_tokens), 84);
+    assert_eq!(offset_of!(CacheReuseConfig, range_penalty_tokens), 88);
 
-    assert_eq!(size_of::<CacheReuseResult>(), 352);
+    assert_eq!(size_of::<CacheReuseResult>(), 968);
     assert_eq!(align_of::<CacheReuseResult>(), 8);
     assert_eq!(offset_of!(CacheReuseResult, status), 0);
     assert_eq!(offset_of!(CacheReuseResult, covered_tokens), 4);
@@ -75,14 +76,14 @@ fn c_abi_layout_matches_expected_darwin_arm64_shape() {
     assert_eq!(offset_of!(CacheReuseResult, search_entered), 65);
     assert_eq!(offset_of!(CacheReuseResult, timing_known), 66);
     assert_eq!(offset_of!(CacheReuseResult, ranges), 68);
-    assert_eq!(offset_of!(CacheReuseResult, insertions), 228);
+    assert_eq!(offset_of!(CacheReuseResult, insertions), 580);
 
-    assert_eq!(CACHE_REUSE_MAX_RANGES, 10);
-    assert_eq!(CACHE_REUSE_MAX_INSERTIONS, 10);
-    assert_eq!(size_of::<[CacheReuseRange; CACHE_REUSE_MAX_RANGES]>(), 160);
+    assert_eq!(CACHE_REUSE_MAX_RANGES, 32);
+    assert_eq!(CACHE_REUSE_MAX_INSERTIONS, 32);
+    assert_eq!(size_of::<[CacheReuseRange; CACHE_REUSE_MAX_RANGES]>(), 512);
     assert_eq!(
         size_of::<[CacheReuseInsertion; CACHE_REUSE_MAX_INSERTIONS]>(),
-        120
+        384
     );
     assert_eq!(CACHE_REUSE_COMPLETE, 0);
     assert_eq!(CACHE_REUSE_NO_FEASIBLE, 1);

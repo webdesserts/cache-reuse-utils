@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use cache_reuse_utils::{
     AllowedInsertions, AnalysisTiming, CacheIdentity, CacheReuseAnalysis, CacheView,
-    DEFAULT_PAD_PENALTY_TOKENS, LossAllowance, PlacementPolicy, PlacementStatus, PlanError,
-    PlanErrorKind,
+    DEFAULT_PAD_PENALTY_TOKENS, DEFAULT_RANGE_PENALTY_TOKENS, LossAllowance, PlacementPolicy,
+    PlacementStatus, PlanError, PlanErrorKind,
 };
 
 pub const CACHE_REUSE_COMPLETE: u32 = 0;
@@ -26,11 +26,12 @@ pub const CACHE_REUSE_ERR_CANCELLED: u32 = 12;
 pub const CACHE_REUSE_ERR_ADMISSION: u32 = 13;
 pub const CACHE_REUSE_ERR_PANIC: u32 = 14;
 /// Maximum selected ranges emitted by the C ABI.
-pub const CACHE_REUSE_MAX_RANGES: usize = 10;
-/// Maximum insertion records emitted by the C ABI.
-pub const CACHE_REUSE_MAX_INSERTIONS: usize = 10;
+pub const CACHE_REUSE_MAX_RANGES: usize = 32;
+/// Maximum insertion records emitted by the C ABI. A plan inserts at most
+/// once before each range.
+pub const CACHE_REUSE_MAX_INSERTIONS: usize = 32;
 const _: () = assert!(CACHE_REUSE_MAX_RANGES == cache_reuse_utils::MAX_RANGES as usize);
-const _: () = assert!(CACHE_REUSE_MAX_INSERTIONS == 10);
+const _: () = assert!(CACHE_REUSE_MAX_INSERTIONS == CACHE_REUSE_MAX_RANGES);
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -75,6 +76,10 @@ pub struct CacheReuseConfig {
     /// Covered tokens one inserted pad must buy back in plan selection.
     /// 0 selects the default of 16 when padding is enabled.
     pub pad_penalty_tokens: u32,
+    /// Covered tokens each range after the first must buy back in plan
+    /// selection. 0 selects the default of 32; use 1 for the smallest
+    /// penalty.
+    pub range_penalty_tokens: u32,
 }
 
 #[repr(C)]
@@ -347,6 +352,10 @@ pub unsafe extern "C" fn cache_reuse_plan(
                         0 if pad_token.is_some() && config.max_new_padding > 0 => {
                             DEFAULT_PAD_PENALTY_TOKENS
                         }
+                        value => value,
+                    },
+                    range_penalty_tokens: match config.range_penalty_tokens {
+                        0 => DEFAULT_RANGE_PENALTY_TOKENS,
                         value => value,
                     },
                     source_start_alignment: config.source_start_alignment,

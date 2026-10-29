@@ -30,6 +30,7 @@ fn config() -> CacheReuseConfig {
         allowed_insertions: ptr::null(),
         allowed_insertion_count: 0,
         pad_penalty_tokens: 0,
+        range_penalty_tokens: 0,
     }
 }
 
@@ -72,6 +73,48 @@ fn plan(
             .into_owned()
     };
     (code, result, text)
+}
+
+#[test]
+fn the_range_penalty_defaults_to_thirty_two() {
+    // Two 40-token blocks with a 5-token stray match between them.
+    let mut target: Vec<i32> = (100..140).collect();
+    target.push(0);
+    target.extend(200..205);
+    target.push(0);
+    target.extend(300..340);
+    let mut source: Vec<i32> = (100..140).collect();
+    source.push(9);
+    source.extend(200..205);
+    source.extend([9, 9]);
+    source.extend(300..340);
+    let mut config = config();
+    config.max_ranges = 3;
+    config.max_prepared_tokens = target.len() as u32;
+    let run = |config: &CacheReuseConfig| {
+        let mut result = CacheReuseResult::default();
+        let code = unsafe {
+            cache_reuse_plan(
+                target.as_ptr(),
+                target.len() as u32,
+                source.as_ptr(),
+                source.len() as u32,
+                1,
+                config,
+                &mut result,
+                ptr::null_mut(),
+                0,
+                None,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(code, 0);
+        (result.range_count, result.covered_tokens)
+    };
+    // The stray's 5 tokens do not repay a 32-token range.
+    assert_eq!(run(&config), (2, 80));
+    config.range_penalty_tokens = 1;
+    assert_eq!(run(&config), (3, 85));
 }
 
 #[test]

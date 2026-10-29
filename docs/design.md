@@ -70,8 +70,8 @@ inserted by the current planning call count as padding.
 
 ## 2. Placement Search (`src/placement_search.rs`)
 
-Given the discovered matches, placement search chooses up to `k` (`<= 10`)
-monotonically increasing ranges in both source and target coordinates that
+Given the discovered matches, placement search chooses up to `k` (at most
+`MAX_RANGES`, which is 32) monotonically increasing ranges in both source and target coordinates that
 satisfy the caller's `PlacementPolicy`.
 
 ### Step 1: Variant derivation and destination-end ordering
@@ -130,10 +130,26 @@ range slots.
 
 Every reachable partial plan is stored as a `Label` in a flat arena with a
 parent pointer (`parent: u32`) and cumulative totals (`ranges`, `padding`,
-`covered`). Within each variant step, candidate labels are deduplicated by
-`(ranges, padding, destination_end, source_end)`, keeping the highest coverage,
-since those four values completely determine how a partial plan can be extended
-by later variants.
+`covered`). How a partial plan can be extended depends only on its padding,
+its end coordinates and how many range slots it has left.
+
+Two exact prunings keep the label count down when `k` is large:
+
+1. **Range dominance:** Within each variant step, labels with the same
+   `(padding, destination_end, source_end)` keep only those that trade more
+   ranges for strictly more coverage. A label with no more ranges and at
+   least the coverage of another extends to a plan that is at least as good
+   under any penalties.
+2. **Reachable coverage:** Every later piece comes from a variant that ends
+   later, and all pieces that continue one range lie in a single maximal
+   match. A label with `r` ranges can therefore gain at most the lengths of
+   the `k - r + 1` longest later variants, and no more than the target tokens
+   left after it. `src/placement_search/bound.rs` precomputes those sums. A
+   label whose bound falls below the loss floor of the best coverage found so
+   far is dropped: neither it nor any extension could ever be eligible.
+
+Without these prunings, `k = 32` over a few thousand matches would keep a
+label for nearly every range count of every variant.
 
 Scanning all previous labels for every variant would take `O(V · L)` time.
 Instead, `src/placement_search/index.rs` separates predecessors into two
@@ -165,14 +181,50 @@ completed label. Every label covering at least
 
 Among eligible labels, `select()` ranks plans lexicographically by:
 
-1. **Highest net coverage:** `covered - padding * pad_penalty_tokens`
+1. **Highest net coverage:**
+   `covered - padding * pad_penalty_tokens - (ranges - 1) * range_penalty_tokens`
 2. **Fewest inserted pad tokens:** smaller `padding`
 3. **Highest raw coverage:** larger `covered`
 4. **Fewest ranges:** smaller `ranges`
 
 When `loss_allowance` is 100% (`admissible_min == 0`) and the winning plan's
-raw coverage does not exceed its pad penalty cost, the planner returns a
-deliberate empty plan rather than a net-negative padded plan. Finally, only the
+net coverage is not positive, the planner returns a deliberate empty plan
+rather than a plan that costs more than it saves.
+
+### Choosing the penalty defaults
+
+The two penalties express costs in prefill tokens.
+
+- **Ranges (`DEFAULT_RANGE_PENALTY_TOKENS = 32`):** Each range after the first
+  is a separate reuse step for the host engine (copying sliding-window state
+  into place and splitting the surrounding fresh prefill). A range split never
+  changes the prompt, so its cost is purely execution overhead. The first
+  range is free: charging it would only turn small single matches into empty
+  plans, which `minimum_physical_reuse_tokens` already controls directly. At
+  `32`, an additional range must bring back more than 32 tokens of coverage to
+  earn its slot. That drops short coincidental phrase matches—such as a
+  repeated five-token phrase in rewritten text—while keeping every real block.
+- **Padding (`DEFAULT_PAD_PENALTY_TOKENS = 16`):** a pad changes the prompt
+  the model sees, while a left trim only costs prefill. Padding a misaligned
+  range by `n` tokens and trimming it by `n` fix the same misalignment, so
+  for a single range trimming always wins. One pad run can realign every
+  later range, though, when an early edit shifts the whole prompt. At 16, a
+  pad is worth it when it saves more than 16 trimmed tokens per pad token,
+  for example when it realigns more than 16 ranges that would each need the
+  same trim.
+
+These defaults were checked on synthetic multi-block prompts at `k = 32`:
+
+| Workload | `range_penalty` 0–4 | 16 | 32–128 |
+|---|---|---|---|
+| 20 blocks of 500 tokens | 20 ranges | 20 | 20 |
+| 15 blocks of 500 and 5 crumbs of 20 | 20 ranges | 20 | 15 (crumbs dropped) |
+| 3 blocks of 2,667 and nine 5-token stray phrases | 12 ranges | 3 | 3 |
+
+With a one-token shift before 20 blocks and prepared alignment 2 or 16, a
+pad penalty of 1–16 inserts one pad run and keeps nearly every token, while
+64 trims every block instead. With 8 blocks and alignment 16, trimming wins
+from 16 up. Engines with measured costs should set both values themselves. Finally, only the
 winning label's parent chain is walked to reconstruct the `Vec<PlacedRange>`
 and `Vec<Insertion>`.
 
@@ -184,17 +236,24 @@ and `Vec<Insertion>`.
 - **Candidate and variant limits:** Discovery retains at most `4,096` maximal
   matches; variant derivation produces at most `max_variants` (default `4,096`)
   variants.
-- **Search state and index limits:** Search retains at most `65,536` (`2^16`)
-  labels and caps total Fenwick-tree nodes at `2,097,152` (`2^21`), stopping
-  with `PlacementStatus::StateLimitReached` if either bound is reached.
+- **Search state and index limits:** Search retains at most `262,144` (`2^18`)
+  labels, about 12 MiB, and caps total Fenwick-tree nodes at `2,097,152`
+  (`2^21`), stopping with `PlacementStatus::StateLimitReached` if either
+  bound is reached. Ordinary prompts stay well inside both at `k = 32`. A
+  stress case with 4,000 tiny segments, prepared alignment 16 and 64 spare
+  pad tokens still reaches the index cap and returns its best plan so far.
 - **Cooperative stopping:** `Stopper` checks cancellation and the deadline at
   every stage boundary and once every `4,096` inner-loop ticks, with no
   background timer threads.
 
-In release builds on Apple Silicon, a full search over `4,000` non-overlapping
-variants with `k = 10` completes in under `10 ms`, a `64k`-token edited-prompt
-analysis completes in `~1.2 ms`, and a `1M`-token edited-prompt analysis
-completes in `~29 ms`.
+In release builds on Apple Silicon:
+
+| Workload | `k = 10` | `k = 32` |
+|---|---|---|
+| 4,000 non-overlapping matches | ~11 ms | ~14 ms |
+| 64k-token edited prompt | ~1.2 ms | ~1.5 ms |
+| 1M-token edited prompt | ~33 ms | ~35–40 ms |
+| 64 blocks of 1,000 tokens, half edited | ~1.5 ms | ~1.3 ms |
 
 ---
 

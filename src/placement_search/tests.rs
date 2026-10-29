@@ -202,7 +202,9 @@ fn segments(count: u32) -> (usize, Vec<CandidateRange>) {
 #[test]
 fn an_early_deadline_returns_the_greedy_incumbent() {
     let (len, matches) = segments(200);
-    let policy = PlacementPolicy::without_padding(len);
+    let mut policy = PlacementPolicy::without_padding(len);
+    // Free ranges, so selection keeps all ten of the longest segments.
+    policy.range_penalty_tokens = 0;
     // Reads for two derivation passes and greedy, then a few search steps.
     let outcome = search_until(
         len,

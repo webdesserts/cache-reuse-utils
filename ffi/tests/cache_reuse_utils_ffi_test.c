@@ -26,6 +26,7 @@ static cache_reuse_config config_for(uint32_t k) {
     c.allowed_insertions = NULL;
     c.allowed_insertion_count = 0;
     c.pad_penalty_tokens = 0; /* default 16 when padding is enabled */
+    c.range_penalty_tokens = 0; /* default 32 */
     return c;
 }
 
@@ -40,17 +41,31 @@ static int plan(const int32_t *target, uint32_t tn, const int32_t *source, uint3
 static bool always_cancel(void *ud) { (void)ud; return true; }
 
 int main(void) {
-    int32_t target[20] = {10,0,11,0,12,0,13,0,14,0,15,0,16,0,17,0,18,0,19,0};
-    int32_t source[20] = {10,99,11,99,12,99,13,99,14,99,15,99,16,99,17,99,18,99,19,99};
-    cache_reuse_config cfg = config_for(10);
+    /* One shared token per block, so the full plan uses every range slot.
+       With no loss allowance the best coverage is mandatory, whatever the
+       range penalty. */
+    int32_t blocks[2 * CACHE_REUSE_MAX_RANGES];
+    int32_t cached[2 * CACHE_REUSE_MAX_RANGES];
+    for (int i = 0; i < CACHE_REUSE_MAX_RANGES; i++) {
+        blocks[2 * i] = cached[2 * i] = 100 + i;
+        blocks[2 * i + 1] = 0;
+        cached[2 * i + 1] = 99;
+    }
+    cache_reuse_config cfg = config_for(CACHE_REUSE_MAX_RANGES);
+    cfg.loss_basis_points = 0;
+    cfg.max_prepared_tokens = 2 * CACHE_REUSE_MAX_RANGES;
     cache_reuse_result r;
     memset(&r, 0, sizeof(r));
-    if (plan(target, 20, source, 20, &cfg, &r, NULL) != 0 ||
-        r.status != CACHE_REUSE_COMPLETE || r.range_count != 10 || r.covered_tokens != 10) {
-        fprintf(stderr, "ten-range plan failed status=%u ranges=%u covered=%u\n",
+    if (plan(blocks, 2 * CACHE_REUSE_MAX_RANGES, cached, 2 * CACHE_REUSE_MAX_RANGES, &cfg, &r,
+             NULL) != 0 ||
+        r.status != CACHE_REUSE_COMPLETE || r.range_count != CACHE_REUSE_MAX_RANGES ||
+        r.covered_tokens != CACHE_REUSE_MAX_RANGES) {
+        fprintf(stderr, "max-range plan failed status=%u ranges=%u covered=%u\n",
                 r.status, r.range_count, r.covered_tokens);
         return 1;
     }
+    int32_t target[20] = {10,0,11,0,12,0,13,0,14,0,15,0,16,0,17,0,18,0,19,0};
+    int32_t source[20] = {10,99,11,99,12,99,13,99,14,99,15,99,16,99,17,99,18,99,19,99};
     cfg = config_for(10);
     cfg.variant_limit = 1;
     memset(&r, 0, sizeof(r));
@@ -60,10 +75,10 @@ int main(void) {
                 r.status, r.range_count);
         return 1;
     }
-    cfg = config_for(11);
+    cfg = config_for(CACHE_REUSE_MAX_RANGES + 1);
     memset(&r, 0, sizeof(r));
     if (plan(target, 20, source, 20, &cfg, &r, NULL) == 0 || r.status != CACHE_REUSE_ERR_INVALID) {
-        fprintf(stderr, "K11 was not rejected\n");
+        fprintf(stderr, "K above CACHE_REUSE_MAX_RANGES was not rejected\n");
         return 1;
     }
     /* Historical source pad token IDs are ordinary content at this boundary:
