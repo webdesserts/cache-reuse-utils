@@ -213,6 +213,30 @@ int main(void) {
         fprintf(stderr, "cancel was not propagated\n");
         return 1;
     }
+    /* Archive schedule: prefill [0,4), import [4,8), covered head at 8,
+     * then the uncaptured tail [8,10). */
+    const cache_reuse_range span = {0, 4, 4, 4};
+    const cache_reuse_archive_geometry geometry = {8, 4, 0, 0, 4};
+    cache_reuse_archive_op ops[8];
+    uint32_t op_len = 0;
+    if (cache_reuse_compile_archive_schedule(10, &span, 1, &geometry, ops, 1, &op_len, NULL, 0) !=
+            CACHE_REUSE_ERR_INVALID || op_len != 6 ||
+        cache_reuse_compile_archive_schedule(10, &span, 1, &geometry, ops, 8, &op_len, NULL, 0) !=
+            CACHE_REUSE_COMPLETE || op_len != 6 ||
+        ops[1].kind != CACHE_REUSE_OP_STAGE_SPAN || ops[2].kind != CACHE_REUSE_OP_IMPORT_CHUNK ||
+        !ops[2].flush_arena || ops[3].kind != CACHE_REUSE_OP_COVERED_HEAD || ops[3].position != 8 ||
+        ops[5].kind != CACHE_REUSE_OP_FINAL_HEAD || ops[5].position != 10) {
+        fprintf(stderr, "archive schedule was not compiled\n");
+        return 1;
+    }
+    const cache_reuse_range executed = {0, 4, 2, 4};
+    cache_reuse_execution_summary summary;
+    if (cache_reuse_reconcile_executed_ranges(&span, 1, &executed, 1, 10, 2, &summary, NULL, 0) !=
+            CACHE_REUSE_COMPLETE || summary.reused_tokens != 2 || summary.covered_end != 6 ||
+        summary.suffix_tokens != 4 || summary.fresh_tokens != 8) {
+        fprintf(stderr, "executed ranges were not reconciled\n");
+        return 1;
+    }
     puts("cache_reuse_utils_ffi_test: ok");
     return 0;
 }

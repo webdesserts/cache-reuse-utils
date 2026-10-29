@@ -7,6 +7,10 @@
 //! Every exported function contains panics and retains no pointer after it
 //! returns. Input and output buffers passed to one call must not overlap.
 
+mod planning;
+
+pub use planning::*;
+
 use std::ffi::{c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::slice;

@@ -3,8 +3,9 @@ use cache_reuse_utils_ffi::{
     CACHE_REUSE_ERR_BUDGET, CACHE_REUSE_ERR_CANCELLED, CACHE_REUSE_ERR_INVALID,
     CACHE_REUSE_ERR_PANIC, CACHE_REUSE_MAX_INSERTIONS, CACHE_REUSE_MAX_RANGES,
     CACHE_REUSE_NO_FEASIBLE, CACHE_REUSE_STATE_LIMIT, CACHE_REUSE_VARIANT_LIMIT,
-    CacheReuseCommonPrefix, CacheReuseConfig, CacheReuseInsertion, CacheReuseRange,
-    CacheReuseResult,
+    CacheReuseArchiveGeometry, CacheReuseArchiveOp, CacheReuseCandidate, CacheReuseCandidatePolicy,
+    CacheReuseCandidateSelection, CacheReuseCommonPrefix, CacheReuseConfig,
+    CacheReuseExecutionSummary, CacheReuseInsertion, CacheReuseRange, CacheReuseResult,
 };
 use std::mem::{align_of, offset_of, size_of};
 
@@ -91,6 +92,26 @@ fn c_abi_layout_matches_expected_darwin_arm64_shape() {
     );
     assert_eq!(offset_of!(CacheReuseCommonPrefix, carried_pads), 8);
     assert_eq!(offset_of!(CacheReuseCommonPrefix, live_logical_tokens), 12);
+
+    assert_eq!(size_of::<CacheReuseCandidate>(), 32);
+    assert_eq!(align_of::<CacheReuseCandidate>(), 8);
+    assert_eq!(offset_of!(CacheReuseCandidate, tokens), 0);
+    assert_eq!(offset_of!(CacheReuseCandidate, token_len), 8);
+    assert_eq!(offset_of!(CacheReuseCandidate, pad_positions), 16);
+    assert_eq!(offset_of!(CacheReuseCandidate, pad_len), 24);
+    assert_eq!(offset_of!(CacheReuseCandidate, planned_reusable_tokens), 28);
+    assert_eq!(size_of::<CacheReuseCandidatePolicy>(), 12);
+    assert_eq!(size_of::<CacheReuseCandidateSelection>(), 12);
+    assert_eq!(offset_of!(CacheReuseCandidateSelection, reusable_tokens), 8);
+    assert_eq!(size_of::<CacheReuseExecutionSummary>(), 24);
+    assert_eq!(offset_of!(CacheReuseExecutionSummary, covered_end), 20);
+    assert_eq!(size_of::<CacheReuseArchiveGeometry>(), 20);
+    assert_eq!(offset_of!(CacheReuseArchiveGeometry, head_alignment), 16);
+    assert_eq!(size_of::<CacheReuseArchiveOp>(), 24);
+    assert_eq!(align_of::<CacheReuseArchiveOp>(), 4);
+    assert_eq!(offset_of!(CacheReuseArchiveOp, position), 12);
+    assert_eq!(offset_of!(CacheReuseArchiveOp, flush_arena), 20);
+    assert_eq!(offset_of!(CacheReuseArchiveOp, defer_decoder), 21);
 
     assert_eq!(CACHE_REUSE_MAX_RANGES, 32);
     assert_eq!(CACHE_REUSE_MAX_INSERTIONS, 32);

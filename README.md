@@ -129,13 +129,50 @@ between physical and logical coordinates. Pads are identified strictly by
 position—never by token value—so ordinary prompt tokens that happen to share the
 pad token ID are preserved intact.
 
+`CoordinateMap` owns a validated physical length and pad set. The matching
+free functions maintain one as a sequence changes: `verify_matches_logical`
+checks a physical sequence against its logical one in `O(N)` without
+allocating, `slice_pad_positions`, `append_unpadded` and
+`truncate_pad_positions` follow a slice, a generated append and a truncation,
+and `verify_span_correspondence` checks that a reused range carries its source
+pads to the same offsets in the destination.
+
+### Planning helpers for engines
+
+Stateless helpers cover the decisions around executing a plan. Each takes
+only coordinates and caller policy, so it runs and tests without an engine.
+
+- **Separators** (`collect_separator_boundaries`, `verify_separator_map`,
+  `SeparatorPolicy`): where a pad may be inserted (next to a caller-chosen
+  separator token), and whether a padded sequence uses only authorized pads
+  beyond a carried prefix.
+- **Candidate selection** (`score_candidate`, `select_candidate`): keep the
+  hot cache, restore a pool entry, or start fresh, from each candidate's
+  aligned common prefix and caller-planned reuse, with a restore penalty.
+- **Reconciliation** (`clip_ranges_to_archive`, `reconcile_executed_ranges`):
+  fit ranges to an archive's source window and an aligned destination cap,
+  and check that executed ranges are an ordered, aligned subset of the plan,
+  accounting for reused, gap, suffix and fresh tokens.
+- **Archive schedule** (`compile_archive_schedule`, `verify_archive_schedule`):
+  compile ranges and an `ArchiveGeometry` (arena size, import chunk, encoder
+  residency thresholds, head alignment) into an ordered list of `ArchiveOp`s
+  that imports or prefills every token once, in order. The schedule never
+  overfills the arena between flushes and releases encoder residency before
+  each prefill segment's tail rows and before any one-token step.
+
 ## C ABI
 
 The `ffi/` crate provides a model-independent C ABI boundary. It builds the
 `cache_reuse_utils_ffi` static library, which exports `cache_reuse_plan`,
-`cache_reuse_materialize` and the coordinate helpers
+`cache_reuse_materialize`, the coordinate helpers
 (`cache_reuse_project_logical`, `cache_reuse_logical_boundary`,
-`cache_reuse_common_prefix`) along with the `cache_reuse_*` structs and `CACHE_REUSE_*` constants declared in the
+`cache_reuse_common_prefix`, `cache_reuse_verify_matches_logical`,
+`cache_reuse_slice_pad_positions`, `cache_reuse_append_unpadded`,
+`cache_reuse_truncate_pad_positions`, `cache_reuse_verify_span_correspondence`)
+and the planning helpers (`cache_reuse_collect_separator_boundaries`,
+`cache_reuse_verify_separator_map`, `cache_reuse_select_candidate`,
+`cache_reuse_clip_ranges_to_archive`, `cache_reuse_reconcile_executed_ranges`,
+`cache_reuse_compile_archive_schedule`) along with the `cache_reuse_*` structs and `CACHE_REUSE_*` constants declared in the
 checked-in header `ffi/include/cache_reuse_utils.h`. Ordinary Rust and C builds
 do not require `cbindgen`.
 
@@ -194,6 +231,11 @@ a downstream Rust crate links `cache-reuse-utils-ffi` and relies on its
   elements. It and the coordinate helpers return `CACHE_REUSE_COMPLETE`,
   `CACHE_REUSE_ERR_INVALID` or `CACHE_REUSE_ERR_PANIC`, and borrow token
   buffers without copying; buffers passed to one call must not overlap.
+- The planning helpers return the same three statuses. A failed check is a
+  result, not an error: `cache_reuse_verify_*` report it through a `bool`
+  output. Outputs are zeroed before validation. When its op buffer is too
+  small, `cache_reuse_compile_archive_schedule` returns
+  `CACHE_REUSE_ERR_INVALID` with `*out_op_len` set to the capacity needed.
 
 To verify that `ffi/include/cache_reuse_utils.h` matches the Rust definitions
 (requires `cbindgen` 0.29.4; writes to a temporary file without touching the
