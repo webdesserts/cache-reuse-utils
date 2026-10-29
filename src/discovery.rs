@@ -42,31 +42,90 @@ fn update_hash(hash: u64, outgoing: u32, incoming: u32, power: u64) -> u64 {
         .wrapping_sub((outgoing as u64 + 1).wrapping_mul(power))
 }
 
+const NONE: u32 = u32::MAX;
+
+/// Most equal-hash source windows examined per target window. A longer
+/// bucket means highly repetitive input; the rest of it is skipped and
+/// discovery reports [`DiscoveryStatus::CandidateLimitReached`]. A long match
+/// is still found from any of its windows whose bucket is within the bound,
+/// because matches extend left as well as right.
+const MAX_BUCKET_PROBES: usize = 256;
+
+/// Probe bound for a target window inside a run of at least
+/// [`LONG_RUN`] copies of one token, past the run's start. Such a window's
+/// matches mostly continue matches already found from the previous window,
+/// so few probes are new.
+const MAX_RUN_PROBES: usize = 16;
+const LONG_RUN: usize = 64;
+
+/// One input with its runs of equal tokens: for each index, where its run
+/// starts and ends. Extension jumps over shared runs in one step, so a long
+/// single-token repeat costs O(1) per match instead of O(length).
+struct Side<'a> {
+    tokens: &'a [u32],
+    run_start: Vec<u32>,
+    run_end: Vec<u32>,
+}
+
+impl<'a> Side<'a> {
+    fn new(tokens: &'a [u32]) -> Self {
+        let mut run_start = vec![0u32; tokens.len()];
+        let mut run_end = vec![tokens.len() as u32; tokens.len()];
+        for i in 1..tokens.len() {
+            if tokens[i] == tokens[i - 1] {
+                run_start[i] = run_start[i - 1];
+            } else {
+                run_start[i] = i as u32;
+            }
+        }
+        for i in (0..tokens.len().saturating_sub(1)).rev() {
+            if tokens[i] == tokens[i + 1] {
+                run_end[i] = run_end[i + 1];
+            } else {
+                run_end[i] = i as u32 + 1;
+            }
+        }
+        Self {
+            tokens,
+            run_start,
+            run_end,
+        }
+    }
+}
+
+/// Extend the verified window at `(s, t)` to a maximal match. Returns
+/// `(source_start, target_start, count)`.
 fn extend_match(
-    source: &[u32],
-    source_start: usize,
-    target: &[u32],
-    target_start: usize,
+    source: &Side<'_>,
+    s: usize,
+    target: &Side<'_>,
+    t: usize,
     minimum: usize,
     stopper: &mut Stopper<'_>,
 ) -> Result<(usize, usize, usize), Stop> {
     let mut left = 0usize;
-    while source_start > left
-        && target_start > left
-        && source[source_start - left - 1] == target[target_start - left - 1]
-    {
+    while s > left && t > left {
+        let (a, b) = (s - left - 1, t - left - 1);
+        if source.tokens[a] != target.tokens[b] {
+            break;
+        }
         stopper.tick()?;
-        left += 1;
+        let run_a = a + 1 - source.run_start[a] as usize;
+        let run_b = b + 1 - target.run_start[b] as usize;
+        left += run_a.min(run_b);
     }
     let mut right = minimum;
-    while source_start + right < source.len()
-        && target_start + right < target.len()
-        && source[source_start + right] == target[target_start + right]
-    {
+    while s + right < source.tokens.len() && t + right < target.tokens.len() {
+        let (a, b) = (s + right, t + right);
+        if source.tokens[a] != target.tokens[b] {
+            break;
+        }
         stopper.tick()?;
-        right += 1;
+        let run_a = source.run_end[a] as usize - a;
+        let run_b = target.run_end[b] as usize - b;
+        right += run_a.min(run_b);
     }
-    Ok((source_start - left, target_start - left, left + right))
+    Ok((s - left, t - left, left + right))
 }
 
 /// Candidate rank: longer is better, then earlier destination, then earlier
@@ -82,6 +141,15 @@ struct Longest {
 }
 
 impl Longest {
+    /// Whether a match of `count` tokens would be dropped by a full heap.
+    fn cannot_enter(&self, count: u32) -> bool {
+        self.heap.len() == MAX_CANDIDATES
+            && self
+                .heap
+                .peek()
+                .is_some_and(|Reverse((weakest, _, _))| count < *weakest)
+    }
+
     fn push(&mut self, range: CandidateRange) {
         let entry = Reverse((
             range.token_count,
@@ -131,10 +199,12 @@ impl Longest {
 ///
 /// Matches are maximal within the window: a match that crosses the protected
 /// prefix or fresh suffix is clipped to the reusable part before ranking.
-/// Every source position is a seed; hash equality is only a filter, and each
-/// seed pair is verified token by token. A per-diagonal coverage end skips
-/// windows inside an already-found run. Destinations are in full-context
-/// coordinates.
+/// Source windows go into a chained hash table in one pass, with chains in
+/// ascending source order. Each target window walks its chain; hash equality
+/// is only a filter, and every pair is verified token by token. A
+/// per-diagonal end skips windows inside a match already found, and once the
+/// candidate heap is full a pair that cannot beat its weakest entry is not
+/// extended. Destinations are in full-context coordinates.
 pub(crate) fn discover(
     context: &[u32],
     window: Range<usize>,
@@ -151,48 +221,89 @@ pub(crate) fn discover(
     }
 
     let power = (0..minimum).fold(1u64, |power, _| power.wrapping_mul(HASH_BASE));
-    let mut seeds = Vec::with_capacity(source.len() - minimum + 1);
+    let windows = source.len() - minimum + 1;
+    let mut hashes = Vec::with_capacity(windows);
     let mut hash = window_hash(source, 0, minimum);
-    for i in 0..=source.len() - minimum {
+    for i in 0..windows {
         stopper.tick()?;
         if i > 0 {
             hash = update_hash(hash, source[i - 1], source[i + minimum - 1], power);
         }
-        seeds.push((hash, i as u32));
+        hashes.push(hash);
     }
-    seeds.sort_unstable();
+    let bits = (2 * windows).next_power_of_two().trailing_zeros();
+    let slot = |hash: u64| (hash.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - bits)) as usize;
+    let mut head = vec![NONE; 1 << bits];
+    let mut next = vec![NONE; windows];
+    for i in (0..windows).rev() {
+        let bucket = &mut head[slot(hashes[i])];
+        next[i] = *bucket;
+        *bucket = i as u32;
+    }
     stopper.check()?;
 
-    // Diagonal `source - destination + target.len()` -> end of the last match
+    let source = Side::new(source);
+    let target = Side::new(target);
+    let (source_len, target_len) = (source.tokens.len(), target.tokens.len());
+    // Diagonal `source - destination + target_len` -> end of the last match
     // found on it, in target coordinates.
-    let mut covered = vec![0u32; source.len() + target.len() + 1];
-    let mut target_hash = window_hash(target, 0, minimum);
-    for destination in 0..=target.len() - minimum {
+    let mut covered = vec![0u32; source_len + target_len + 1];
+    let mut target_hash = window_hash(target.tokens, 0, minimum);
+    for destination in 0..=target_len - minimum {
         stopper.tick()?;
         if destination > 0 {
             target_hash = update_hash(
                 target_hash,
-                target[destination - 1],
-                target[destination + minimum - 1],
+                target.tokens[destination - 1],
+                target.tokens[destination + minimum - 1],
                 power,
             );
         }
-        let first = seeds.partition_point(|&(hash, _)| hash < target_hash);
-        for &(hash, source_start) in &seeds[first..] {
-            if hash != target_hash {
+        let last = destination + minimum - 1;
+        let run_start = target.run_start[last] as usize;
+        let in_run =
+            run_start < destination && target.run_end[last] as usize - run_start >= LONG_RUN;
+        let max_probes = if in_run {
+            MAX_RUN_PROBES
+        } else {
+            MAX_BUCKET_PROBES
+        };
+        let mut probes = 0;
+        let mut cursor = head[slot(target_hash)];
+        while cursor != NONE {
+            let source_start = cursor as usize;
+            cursor = next[source_start];
+            if hashes[source_start] != target_hash {
+                continue;
+            }
+            if probes == max_probes {
+                longest.dropped = true;
                 break;
             }
+            probes += 1;
             stopper.tick()?;
-            let source_start = source_start as usize;
-            let diagonal = source_start + target.len() - destination;
+            let diagonal = source_start + target_len - destination;
             if covered[diagonal] >= (destination + minimum) as u32
-                || source[source_start..source_start + minimum]
-                    != target[destination..destination + minimum]
+                || source.tokens[source_start..source_start + minimum]
+                    != target.tokens[destination..destination + minimum]
             {
                 continue;
             }
-            let (start, begin, count) =
-                extend_match(source, source_start, target, destination, minimum, stopper)?;
+            // The longest match that could pass through this window.
+            let bound = source_start.min(destination)
+                + (source_len - source_start).min(target_len - destination);
+            if longest.cannot_enter(bound as u32) {
+                longest.dropped = true;
+                continue;
+            }
+            let (start, begin, count) = extend_match(
+                &source,
+                source_start,
+                &target,
+                destination,
+                minimum,
+                stopper,
+            )?;
             covered[diagonal] = (begin + count) as u32;
             longest.push(CandidateRange {
                 source_start: start as u32,
@@ -257,11 +368,15 @@ mod tests {
             state = state
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            ((state >> 33) % 4) as u32
+            (state >> 33) as u32
         };
-        for case in 0..200usize {
-            let source: Vec<u32> = (0..1 + case % 9).map(|_| next()).collect();
-            let target: Vec<u32> = (0..1 + (case / 9) % 9).map(|_| next()).collect();
+        for case in 0..600usize {
+            // Two- and three-token alphabets produce long runs and repeats.
+            let alphabet = 2 + (case % 3) as u32;
+            let source: Vec<u32> = (0..1 + case % 29).map(|_| next() % alphabet).collect();
+            let target: Vec<u32> = (0..1 + (case / 7) % 31)
+                .map(|_| next() % alphabet)
+                .collect();
             let start = case % 3 % (target.len() + 1);
             let end = target.len() - (case / 3 % 2).min(target.len() - start);
             let minimum = 1 + (case % 3) as u32;
@@ -271,6 +386,28 @@ mod tests {
                 "case {case}"
             );
         }
+    }
+
+    #[test]
+    fn a_long_single_token_repeat_is_bounded_and_keeps_the_longest_match() {
+        // Every source window shares one hash, so each target window's bucket
+        // is the whole source. Probes are capped and runs extend in one step.
+        let tokens = vec![7u32; 100_000];
+        let mut cancel = || false;
+        let mut stopper = Stopper::new(Instant::now() + Duration::from_secs(60), &mut cancel);
+        let cache = CacheView {
+            tokens: &tokens,
+            identity: CacheIdentity::new(1),
+            minimum_match_tokens: 4,
+        };
+        let outcome = discover(&tokens, 0..tokens.len(), cache, &mut stopper).expect("discovery");
+        assert_eq!(outcome.status, DiscoveryStatus::CandidateLimitReached);
+        assert_eq!(outcome.ranges.len(), MAX_CANDIDATES);
+        assert!(outcome.ranges.contains(&CandidateRange {
+            source_start: 0,
+            destination_start: 0,
+            token_count: 100_000,
+        }));
     }
 
     #[test]

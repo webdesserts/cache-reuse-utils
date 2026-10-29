@@ -7,7 +7,8 @@
 //!    variant just enough to clear the previous range and meet source and
 //!    count alignment, then inserts the minimal padding the policy requires.
 //!    Plans live in an arena of parent-pointer labels, one per
-//!    `(variant, end, ranges, padding)` with the best coverage.
+//!    `(variant, ends, ranges, padding)` with the best coverage. An index
+//!    finds predecessors without scanning every label (see [`index`]).
 //! 4. Select among plans within the loss allowance of the best coverage,
 //!    charging `pad_penalty_tokens` per inserted pad.
 
@@ -18,6 +19,10 @@ use crate::candidate::CandidateRange;
 use crate::error::PlanErrorKind;
 use crate::placement::{Insertion, PlacedRange, PlacementPolicy, PlacementStatus};
 use crate::timing::{Stop, Stopper};
+
+mod index;
+
+use index::{Entry, Index};
 
 /// Cap on retained plan labels. A label is a few dozen bytes, so this bounds
 /// search memory to a few MiB.
@@ -266,12 +271,99 @@ impl Search<'_> {
         stop
     }
 
+    /// Index labels from `start` on. Stops the search when the index is full.
+    fn index_from(&mut self, index: &mut Index, start: usize) {
+        for (label, entry) in self.labels.iter().enumerate().skip(start) {
+            let added = index.insert(Entry {
+                label: label as u32,
+                destination_end: entry.piece.destination_end(),
+                source_end: entry.piece.source_end(),
+                ranges: entry.ranges,
+                padding: entry.padding,
+                covered: entry.covered,
+            });
+            if !added {
+                self.limit_status = Some(PlacementStatus::StateLimitReached);
+                return;
+            }
+        }
+    }
+
+    /// Offer `variant` after every label that can precede it: the best clear
+    /// predecessor per `(ranges, padding)` group, labels ending exactly at its
+    /// start (which may coalesce), and every overlapping label.
+    fn extend(
+        &self,
+        index: &Index,
+        variant: Variant,
+        stopper: &mut Stopper<'_>,
+        offer: &mut impl FnMut(Label),
+    ) -> Result<(), Stop> {
+        let mut try_parent = |parent: u32| {
+            if let Some(label) = self.step(Some(parent), variant) {
+                offer(label);
+            }
+        };
+        let Some(start) = fit(variant, None, self.policy) else {
+            return Ok(());
+        };
+        let (destination, source) = (start.destination_start, start.source_start);
+        for (group, &(ranges, padding)) in index.groups().iter().enumerate() {
+            stopper.tick()?;
+            if ranges >= self.k {
+                continue;
+            }
+            let base = destination as u64 + padding as u64;
+            let Some(pad) = minimal_padding(base, padding, self.policy, self.context_len) else {
+                continue;
+            };
+            let max_end = if pad == 0 {
+                Some(destination)
+            } else {
+                self.policy.allowed_insertions.latest_in(0, destination)
+            };
+            if let Some(parent) = max_end.and_then(|end| index.best_clear(group, end, source)) {
+                try_parent(parent);
+            }
+        }
+        for parent in index.ending_in_destination(destination..destination + 1) {
+            stopper.tick()?;
+            if self.labels[parent as usize].piece.source_end() == source {
+                try_parent(parent);
+            }
+        }
+        for parent in index.ending_in_destination(destination + 1..variant.destination_end()) {
+            stopper.tick()?;
+            if self.labels[parent as usize].piece.source_end() < variant.source_end() {
+                try_parent(parent);
+            }
+        }
+        for parent in index.ending_in_source(source + 1..variant.source_end()) {
+            stopper.tick()?;
+            if self.labels[parent as usize].piece.destination_end() <= destination {
+                try_parent(parent);
+            }
+        }
+        Ok(())
+    }
+
     fn run(&mut self, variants: &[Variant], stopper: &mut Stopper<'_>) -> Result<(), Stop> {
-        self.seed_greedy(variants, stopper)?;
+        let starts = variants
+            .iter()
+            .filter_map(|&variant| fit(variant, None, self.policy))
+            .map(|start| start.source_start)
+            .collect();
+        let mut index = Index::new(starts);
+        let seeded = self.seed_greedy(variants, stopper);
+        self.index_from(&mut index, 0);
+        seeded?;
         // (ranges, padding, destination end, source end) -> index in `fresh`.
         let mut slots: HashMap<(u32, u32, u32, u32), usize> = HashMap::new();
         let mut fresh: Vec<Label> = Vec::new();
         for &variant in variants {
+            if self.limit_status == Some(PlacementStatus::StateLimitReached) {
+                return Ok(());
+            }
             slots.clear();
             let mut offer = |label: Label| {
                 let key = (
@@ -294,28 +386,16 @@ impl Search<'_> {
                 if let Some(label) = self.step(None, variant) {
                     offer(label);
                 }
-                for parent in 0..self.labels.len() {
-                    if let Err(error) = stopper.tick() {
-                        stop = Some(error);
-                        break;
-                    }
-                    let piece = self.labels[parent].piece;
-                    if piece.destination_end() >= variant.destination_end()
-                        || piece.source_end() >= variant.source_end()
-                    {
-                        continue;
-                    }
-                    if let Some(label) = self.step(Some(parent as u32), variant) {
-                        offer(label);
-                    }
-                }
+                stop = self.extend(&index, variant, stopper, &mut offer).err();
             }
             let room = self.max_states.saturating_sub(self.labels.len());
             if fresh.len() > room {
                 fresh.truncate(room);
                 self.limit_status = Some(PlacementStatus::StateLimitReached);
             }
+            let first_new = self.labels.len();
             self.labels.append(&mut fresh);
+            self.index_from(&mut index, first_new);
             match stop {
                 Some(Stop::Cancelled) => return Err(Stop::Cancelled),
                 Some(Stop::Deadline) => {
