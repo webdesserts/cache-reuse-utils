@@ -194,17 +194,20 @@ impl Longest {
     }
 }
 
-/// Discover maximal exact matches at least `cache.minimum_match_tokens` long
-/// inside `window` of the context, keeping the [`MAX_CANDIDATES`] longest.
+/// Discover maximal exact matches of length at least `cache.minimum_match_tokens`
+/// inside `window` of the target context, retaining the [`MAX_CANDIDATES`] longest.
 ///
-/// Matches are maximal within the window: a match that crosses the protected
-/// prefix or fresh suffix is clipped to the reusable part before ranking.
-/// Source windows go into a chained hash table in one pass, with chains in
-/// ascending source order. Each target window walks its chain; hash equality
-/// is only a filter, and every pair is verified token by token. A
-/// per-diagonal end skips windows inside a match already found, and once the
-/// candidate heap is full a pair that cannot beat its weakest entry is not
-/// extended. Destinations are in full-context coordinates.
+/// Matches are maximal within `window`: any shared span that crosses the
+/// protected prefix or fresh suffix is clipped to the reusable window before
+/// ranking. Source windows are linked into a flat power-of-two chained hash
+/// table (`head` and `next`) in a single pass with chains in ascending source
+/// order. Each target window walks its chain and verifies token equality
+/// directly so hash collisions never produce false matches. A per-diagonal
+/// watermark skips interior windows of matches already discovered, run bounds
+/// jump across single-token repeats in `O(1)`, and once the candidate heap is
+/// full, any window pair whose geometric bound cannot beat the weakest kept
+/// match is skipped before extension. Returned `destination_start` coordinates
+/// are relative to the full `context` slice.
 pub(crate) fn discover(
     context: &[u32],
     window: Range<usize>,

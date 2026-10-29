@@ -90,6 +90,19 @@ fn overlapping_matches_chain_without_a_trim_allowance() {
 }
 
 #[test]
+fn a_match_starting_inside_a_longer_one_can_precede_its_remainder() {
+    // Source alignment 4 trims the long match's first two tokens anyway. The
+    // short match covers one of them and the long one follows it unchanged,
+    // although the short match starts later in the target.
+    let mut policy = PlacementPolicy::without_padding(20);
+    policy.source_start_alignment = 4;
+    let matches = [range(2, 0, 10), range(0, 1, 1)];
+    let outcome = run(20, &matches, 2, &policy);
+    assert_eq!(spans(&outcome), [(0, 1, 1), (4, 2, 8)]);
+    assert_eq!(outcome.covered, 9);
+}
+
+#[test]
 fn a_trimmed_piece_and_its_continuation_coalesce_into_one_range() {
     // Right-trim variants of a match can chain back onto the same diagonal;
     // the plan must still report one range.
@@ -103,6 +116,8 @@ fn a_trimmed_piece_and_its_continuation_coalesce_into_one_range() {
 fn padding_is_inserted_at_the_latest_allowed_boundary() {
     let mut policy = padded(20, 4);
     policy.allowed_insertions = AllowedInsertions::Boundaries(&[2, 4]);
+    // Free padding, so the padded piece beats trimming one token.
+    policy.pad_penalty_tokens = 0;
     let outcome = run(20, &[range(0, 5, 10)], 1, &policy);
     assert_eq!(outcome.padding, 1);
     assert_eq!(outcome.insertions[0].before_target_index, 4);
@@ -113,6 +128,9 @@ fn padding_is_inserted_at_the_latest_allowed_boundary() {
 fn pad_penalty_trades_coverage_for_padding_within_the_floor() {
     let matches = [range(0, 4, 900), range(2000, 1, 980)];
     let mut policy = padded(1000, 2);
+    // Source alignment makes left-trimming the 980 infeasible, so padding
+    // is its only placement.
+    policy.source_start_alignment = 1000;
     policy.loss_allowance = LossAllowance::from_percent(10);
     // 980 needs one pad; 980 - 16 beats 900.
     assert_eq!(run(1000, &matches, 1, &policy).covered, 980);
@@ -130,10 +148,42 @@ fn pad_penalty_trades_coverage_for_padding_within_the_floor() {
 fn full_allowance_returns_empty_when_padding_costs_more_than_it_buys() {
     let mut policy = padded(20, 1);
     policy.loss_allowance = LossAllowance::from_percent(100);
+    // Trimming to an aligned start would leave 4 tokens, below the minimum.
+    policy.minimum_physical_reuse_tokens = 5;
     let outcome = run(20, &[range(0, 1, 5)], 1, &policy);
     assert!(outcome.plan.is_empty());
     assert_eq!(outcome.best_useful, 5);
     assert_eq!(outcome.status, PlacementStatus::Complete);
+}
+
+#[test]
+fn an_unaligned_piece_is_padded_or_left_trimmed_whichever_nets_more() {
+    let matches = [range(0, 1, 10)];
+    let mut policy = padded(20, 4);
+    // One pad costs 16; trimming one token costs 1.
+    let outcome = run(20, &matches, 1, &policy);
+    assert_eq!(spans(&outcome), [(1, 2, 9)]);
+    assert_eq!((outcome.padding, outcome.plan[0].prepared_start), (0, 2));
+    assert_eq!(outcome.best_useful, 10);
+    // Free padding keeps every token.
+    policy.pad_penalty_tokens = 0;
+    let outcome = run(20, &matches, 1, &policy);
+    assert_eq!(spans(&outcome), [(0, 1, 10)]);
+    assert_eq!((outcome.padding, outcome.plan[0].prepared_start), (1, 2));
+}
+
+#[test]
+fn left_trimming_retries_until_source_and_prepared_alignment_agree() {
+    // Prepared starts must be multiples of 4 and source starts multiples
+    // of 3, on the diagonal where source equals destination. Source
+    // alignment first moves the start to 3; the aligned prepared start 4
+    // realigns the source to 6; then 8 realigns it to 9; then 12 fits both.
+    let mut policy = padded(40, 0);
+    policy.prepared_target_start_alignment = 4;
+    policy.source_start_alignment = 3;
+    let outcome = run(40, &[range(1, 1, 30)], 1, &policy);
+    assert_eq!(spans(&outcome), [(12, 12, 19)]);
+    assert_eq!(outcome.padding, 0);
 }
 
 /// Segments of increasing length, so the longest are last in destination

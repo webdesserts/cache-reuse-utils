@@ -2,8 +2,8 @@
 
 use cache_reuse_utils::{
     AdmissionDeniedReason, AnalysisStage, CacheIdentity, CacheReuseAnalysis, CacheView,
-    ContractError, DiscoveryStatus, InputSide, PlacedRange, PlacementPolicy, PlanError,
-    PlanErrorKind, ReusePlan,
+    ContractError, DiscoveryStatus, InputSide, PlacedRange, PlacementPolicy, PlacementStatus,
+    PlanError, PlanErrorKind, ReusePlan,
 };
 use std::time::{Duration, Instant};
 
@@ -70,18 +70,23 @@ fn repeated_competing_matches_remain_available_to_the_selector() {
 #[test]
 fn minimum_filters_short_runs_and_handles_no_matches() {
     // A run shorter than the minimum is filtered after actual discovery.
+    // With nothing to place, search is complete; `NoFeasibleReuse` is kept
+    // for matches that could not be placed.
     let filtered = run(&[1, 2, 3, 0], &[9, 1, 2, 3, 9], 4, 1).expect("filtered short run");
     assert!(filtered.ranges().is_empty());
+    assert_eq!(filtered.placement_status(), PlacementStatus::Complete);
     assert!(filtered.timing().discovery().is_some());
     // minimum longer than an input is a complete no-work no-match, not an error.
     let too_long = run(&[1, 2], &[9, 1, 2, 9], 4, 1).expect("minimum longer than input");
     assert!(too_long.ranges().is_empty());
+    assert_eq!(too_long.placement_status(), PlacementStatus::Complete);
     assert_eq!(too_long.discovery_status(), DiscoveryStatus::Complete);
     assert!(too_long.timing().discovery().is_none());
     assert!(too_long.timing().search().is_none());
 
     let actual_none = run(&[1, 2, 3], &[4, 5, 6], 2, 1).expect("complete no match");
     assert!(actual_none.ranges().is_empty());
+    assert_eq!(actual_none.placement_status(), PlacementStatus::Complete);
     assert_eq!(actual_none.discovery_status(), DiscoveryStatus::Complete);
     assert!(actual_none.timing().discovery().is_some());
     assert!(actual_none.timing().search().is_none());

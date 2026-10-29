@@ -1,16 +1,23 @@
 //! Placement search over discovered maximal matches.
 //!
-//! 1. Derive variants: each maximal match, then the declared trim rectangle,
-//!    capped at `max_variants`.
-//! 2. Seed a greedy incumbent so a deadline still returns a global plan.
-//! 3. Extend plans in destination order. Each step left-trims the next
-//!    variant just enough to clear the previous range and meet source and
-//!    count alignment, then inserts the minimal padding the policy requires.
-//!    Plans live in an arena of parent-pointer labels, one per
-//!    `(variant, ends, ranges, padding)` with the best coverage. An index
-//!    finds predecessors without scanning every label (see [`index`]).
-//! 4. Select among plans within the loss allowance of the best coverage,
-//!    charging `pad_penalty_tokens` per inserted pad.
+//! Search proceeds in four phases:
+//!
+//! 1. **Variant derivation:** Emit each maximal match untrimmed first, followed
+//!    by any extra trims requested by `max_trim_left` and `max_trim_right`,
+//!    up to `max_variants`, sorted by ascending `destination_end`.
+//! 2. **Greedy incumbent seeding:** Greedily chain variants from longest to
+//!    shortest while coverage improves, so an early deadline or state limit
+//!    still returns a plan built from the longest matches.
+//! 3. **Arena dynamic programming:** Extend partial plans (`Label`s in a flat
+//!    parent-pointer arena) in `destination_end` order. Each step left-trims
+//!    the next variant just enough to clear the previous range and satisfy
+//!    source/count alignment, then evaluates both the minimally padded
+//!    placement and the zero-pad alignment left-trimmed alternative. Non-overlapping
+//!    predecessors are queried in `O(log² V)` via [`index::Index`], while
+//!    overlapping predecessors are visited from ordered end-coordinate maps.
+//! 4. **Plan selection:** Among completed plans within the policy's
+//!    [`crate::LossAllowance`] of the best raw coverage, choose the plan that
+//!    maximizes `covered - padding * pad_penalty_tokens`.
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -29,6 +36,10 @@ use index::{Entry, Index};
 pub(crate) const MAX_STATES: usize = 1 << 16;
 
 const NO_PARENT: u32 = u32::MAX;
+
+/// Bound on re-trims when source alignment keeps moving a piece past an
+/// aligned prepared start. Exceeding it drops only the trimmed alternative.
+const MAX_ALIGNMENT_RETRIES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Variant {
@@ -89,7 +100,7 @@ impl PlacementOutcome {
 /// Untrimmed matches first, then the declared trim rectangle, up to
 /// `max_variants`. Distinct maximal matches never share a sub-range, so no
 /// deduplication is needed. Variants no trim can make usable are skipped.
-/// Returns the variants in destination order and whether the cap truncated
+/// Returns the variants in destination-end order and whether the cap truncated
 /// them.
 fn derive_variants(
     matches: &[CandidateRange],
@@ -125,7 +136,11 @@ fn derive_variants(
             }
         }
     }
-    variants.sort_unstable_by_key(|v| (v.destination_start, v.source_start, v.token_count));
+    // A placed piece can only follow pieces that end before it, and left
+    // trims keep a variant's end, so end order visits every predecessor first.
+    // A match contained in a longer one's span therefore precedes the longer
+    // one's trimmed remainder.
+    variants.sort_unstable_by_key(|v| (v.destination_end(), v.destination_start, v.source_start));
     Ok((variants, truncated))
 }
 
@@ -164,15 +179,21 @@ fn minimal_padding(
     policy: &PlacementPolicy<'_>,
     context_len: usize,
 ) -> Option<u32> {
-    let alignment = policy.prepared_target_start_alignment as u64;
-    let start = base_prepared
-        .max(policy.minimum_prepared_reuse_start as u64)
-        .next_multiple_of(alignment);
-    let padding = u32::try_from(start - base_prepared).ok()?;
+    let padding = u32::try_from(alignment_gap(base_prepared, policy)).ok()?;
     let total = prior_padding.checked_add(padding)?;
     let prepared = context_len as u64 + total as u64;
     (total <= policy.max_new_padding && prepared <= policy.max_prepared_tokens as u64)
         .then_some(padding)
+}
+
+/// Tokens needed before `base_prepared` to meet prepared-start alignment and
+/// the minimum prepared start, ignoring budgets.
+fn alignment_gap(base_prepared: u64, policy: &PlacementPolicy<'_>) -> u64 {
+    let alignment = policy.prepared_target_start_alignment as u64;
+    base_prepared
+        .max(policy.minimum_prepared_reuse_start as u64)
+        .next_multiple_of(alignment)
+        - base_prepared
 }
 
 struct Search<'a> {
@@ -187,20 +208,69 @@ struct Search<'a> {
 
 impl Search<'_> {
     /// Place `variant` after `parent`, or first when `parent` is `None`.
-    fn step(&self, parent: Option<u32>, variant: Variant) -> Option<Label> {
+    ///
+    /// When the fitted piece needs padding, there are two placements: the
+    /// padded one, and the piece left-trimmed until its prepared start meets
+    /// alignment and the minimum with no padding. Either may be infeasible.
+    fn step(&self, parent: Option<u32>, variant: Variant) -> [Option<Label>; 2] {
         let previous = parent.map(|index| self.labels[index as usize]);
         let after = previous.map(|label| (label.piece.destination_end(), label.piece.source_end()));
-        let piece = fit(variant, after, self.policy)?;
+        let Some(piece) = fit(variant, after, self.policy) else {
+            return [None, None];
+        };
+        let prior_padding = previous.map_or(0, |label| label.padding);
+        let base_prepared = piece.destination_start as u64 + prior_padding as u64;
+        match minimal_padding(base_prepared, prior_padding, self.policy, self.context_len) {
+            Some(0) => [self.place(parent, previous, piece, 0), None],
+            pad => [
+                pad.and_then(|pad| self.place(parent, previous, piece, pad)),
+                self.trim_to_aligned(variant, piece, after, prior_padding)
+                    .and_then(|piece| self.place(parent, previous, piece, 0)),
+            ],
+        }
+    }
+
+    /// Left-trim `piece` (fitted from `variant`) until its prepared start
+    /// needs no padding. Source alignment can move the start past an aligned
+    /// prepared start, so this retries a bounded number of times.
+    fn trim_to_aligned(
+        &self,
+        variant: Variant,
+        mut piece: Variant,
+        after: Option<(u32, u32)>,
+        prior_padding: u32,
+    ) -> Option<Variant> {
+        let source_floor = after.map_or(0, |(_, source)| source);
+        for _ in 0..MAX_ALIGNMENT_RETRIES {
+            let base = piece.destination_start as u64 + prior_padding as u64;
+            match alignment_gap(base, self.policy) {
+                0 => return Some(piece),
+                gap => {
+                    let destination = u32::try_from(piece.destination_start as u64 + gap).ok()?;
+                    piece = fit(variant, Some((destination, source_floor)), self.policy)?;
+                }
+            }
+        }
+        None
+    }
+
+    /// The label for `piece` after `previous`, with `pad` tokens inserted at
+    /// the latest allowed boundary before it, if the policy permits.
+    fn place(
+        &self,
+        parent: Option<u32>,
+        previous: Option<Label>,
+        piece: Variant,
+        pad: u32,
+    ) -> Option<Label> {
         let suffix_start = self.context_len as u32 - self.policy.fresh_suffix_tokens;
         if piece.destination_start < self.policy.protected_prefix_tokens
             || piece.destination_end() > suffix_start
         {
             return None;
         }
+        let after = previous.map(|label| (label.piece.destination_end(), label.piece.source_end()));
         let gap_start = after.map_or(self.policy.protected_prefix_tokens, |(end, _)| end);
-        let prior_padding = previous.map_or(0, |label| label.padding);
-        let base_prepared = piece.destination_start as u64 + prior_padding as u64;
-        let pad = minimal_padding(base_prepared, prior_padding, self.policy, self.context_len)?;
         let boundary = if pad == 0 {
             piece.destination_start
         } else {
@@ -218,19 +288,32 @@ impl Search<'_> {
             piece,
             insertion: (boundary, pad),
             merged,
-            padding: prior_padding + pad,
+            padding: previous.map_or(0, |label| label.padding) + pad,
             ranges,
             covered: previous.map_or(0, |label| label.covered) + piece.token_count as u64,
         })
     }
 
-    /// Labels for `chain` (variant indexes in destination order), appended
+    /// Coverage net of the pad penalty, the first selection criterion.
+    fn net(&self, label: &Label) -> u64 {
+        let penalty = label.padding as u64 * self.policy.pad_penalty_tokens as u64;
+        label.covered.saturating_sub(penalty)
+    }
+
+    /// Labels for `chain` (variant indexes in destination-end order), appended
     /// after the arena's current end, or `None` if the chain is infeasible.
     fn chain(&mut self, variants: &[Variant], chain: &[usize]) -> Option<u64> {
         let base = self.labels.len();
         let mut parent = None;
         for &index in chain {
-            match self.step(parent, variants[index]) {
+            let [padded, trimmed] = self.step(parent, variants[index]);
+            let best = match (padded, trimmed) {
+                (Some(padded), Some(trimmed)) if self.net(&trimmed) >= self.net(&padded) => {
+                    Some(trimmed)
+                }
+                (padded, trimmed) => padded.or(trimmed),
+            };
+            match best {
                 Some(label) => {
                     parent = Some(self.labels.len() as u32);
                     self.labels.push(label);
@@ -300,7 +383,7 @@ impl Search<'_> {
         offer: &mut impl FnMut(Label),
     ) -> Result<(), Stop> {
         let mut try_parent = |parent: u32| {
-            if let Some(label) = self.step(Some(parent), variant) {
+            for label in self.step(Some(parent), variant).into_iter().flatten() {
                 offer(label);
             }
         };
@@ -313,16 +396,24 @@ impl Search<'_> {
             if ranges >= self.k {
                 continue;
             }
+            // A clear predecessor ends at or before the destination start.
+            // A padded placement also needs an allowed boundary after it; the
+            // trimmed alternative does not.
             let base = destination as u64 + padding as u64;
-            let Some(pad) = minimal_padding(base, padding, self.policy, self.context_len) else {
-                continue;
+            let padded_end = match minimal_padding(base, padding, self.policy, self.context_len) {
+                Some(0) => None,
+                Some(_) => self.policy.allowed_insertions.latest_in(0, destination),
+                None => None,
             };
-            let max_end = if pad == 0 {
-                Some(destination)
-            } else {
-                self.policy.allowed_insertions.latest_in(0, destination)
-            };
-            if let Some(parent) = max_end.and_then(|end| index.best_clear(group, end, source)) {
+            let best = index.best_clear(group, destination, source);
+            if let Some(parent) = best {
+                try_parent(parent);
+            }
+            if let Some(parent) = padded_end
+                .filter(|&end| end < destination)
+                .and_then(|end| index.best_clear(group, end, source))
+                .filter(|&parent| Some(parent) != best)
+            {
                 try_parent(parent);
             }
         }
@@ -383,7 +474,7 @@ impl Search<'_> {
             };
             let mut stop = stopper.tick().err();
             if stop.is_none() {
-                if let Some(label) = self.step(None, variant) {
+                for label in self.step(None, variant).into_iter().flatten() {
                     offer(label);
                 }
                 stop = self.extend(&index, variant, stopper, &mut offer).err();

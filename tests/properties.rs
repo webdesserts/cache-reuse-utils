@@ -42,15 +42,35 @@ fn analyze(context: &[u32], cache: &[u32], k: u32, policy: PlacementPolicy<'_>) 
     .expect("plan")
 }
 
+/// Where an unpadded range may start in the target: a multiple of
+/// `alignment` at or after `minimum`.
+#[derive(Clone, Copy)]
+struct Starts {
+    alignment: usize,
+    minimum: usize,
+}
+
+const ANY_START: Starts = Starts {
+    alignment: 1,
+    minimum: 0,
+};
+
 /// Most tokens coverable by at most `k` ranges that increase in both
-/// sequences and stay inside `window`, by exhaustive memoized search over
-/// every exact sub-range.
-fn best_coverage(source: &[u32], target: &[u32], window: (usize, usize), k: usize) -> u64 {
+/// sequences, stay inside `window` and begin at allowed `starts`, by
+/// exhaustive memoized search over every exact sub-range.
+fn best_coverage(
+    source: &[u32],
+    target: &[u32],
+    window: (usize, usize),
+    k: usize,
+    starts: Starts,
+) -> u64 {
     struct Oracle<'a> {
         source: &'a [u32],
         target: &'a [u32],
         window: (usize, usize),
         k: usize,
+        starts: Starts,
         memo: Vec<Option<u64>>,
     }
 
@@ -64,6 +84,9 @@ fn best_coverage(source: &[u32], target: &[u32], window: (usize, usize), k: usiz
             let mut best = 0;
             if left > 0 {
                 for t in t0.max(self.window.0)..self.window.1 {
+                    if t % self.starts.alignment != 0 || t < self.starts.minimum {
+                        continue;
+                    }
                     for s in s0..self.source.len() {
                         let mut n = 0;
                         while t + n < self.window.1
@@ -87,6 +110,7 @@ fn best_coverage(source: &[u32], target: &[u32], window: (usize, usize), k: usiz
         target,
         window,
         k,
+        starts,
         memo: vec![None; size],
     };
     oracle.best(0, 0, k)
@@ -109,10 +133,49 @@ fn search_matches_an_exhaustive_oracle_without_padding() {
         let window = (prefix as usize, context.len() - suffix as usize);
         assert_eq!(
             plan.covered_tokens(),
-            best_coverage(&cache, &context, window, k as usize),
+            best_coverage(&cache, &context, window, k as usize, ANY_START),
             "case {case}: context {context:?} cache {cache:?} k {k} window {window:?}"
         );
         assert!(plan.ranges().len() <= k as usize);
+        assert_eq!(
+            plan.placement().materialize(&context, &cache).unwrap(),
+            context
+        );
+    }
+}
+
+/// Without padding, an unaligned match is left-trimmed to an aligned start.
+/// A single range is then exactly the best aligned sub-range. Several ranges
+/// may need a right trim the search does not make, so for them the oracle
+/// is only an upper bound.
+#[test]
+fn aligned_starts_without_padding_match_the_oracle_for_one_range() {
+    let mut rng = Rng(13);
+    for case in 0..400 {
+        let context = rng.tokens(10, 3);
+        let cache = rng.tokens(10, 3);
+        let k = 1 + rng.below(3);
+        let starts = Starts {
+            alignment: 1 + rng.below(3) as usize,
+            minimum: rng.below(4) as usize,
+        };
+        let mut policy = PlacementPolicy::without_padding(context.len());
+        policy.loss_allowance = LossAllowance::from_percent(0);
+        policy.prepared_target_start_alignment = starts.alignment as u32;
+        policy.minimum_prepared_reuse_start = starts.minimum as u32;
+        let plan = analyze(&context, &cache, k, policy);
+        let best = best_coverage(&cache, &context, (0, context.len()), k as usize, starts);
+        let message = format!("case {case}: context {context:?} cache {cache:?} k {k}");
+        if k == 1 {
+            assert_eq!(plan.covered_tokens(), best, "{message}");
+        } else {
+            assert!(plan.covered_tokens() <= best, "{message}");
+        }
+        assert!(plan.placement().insertions.is_empty());
+        for range in plan.ranges() {
+            assert_eq!(range.prepared_start as usize % starts.alignment, 0);
+            assert!(range.prepared_start as usize >= starts.minimum);
+        }
         assert_eq!(
             plan.placement().materialize(&context, &cache).unwrap(),
             context

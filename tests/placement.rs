@@ -66,12 +66,34 @@ fn padding_is_inserted_at_the_latest_allowed_boundary() {
     );
 }
 
-#[test]
-fn geometry_that_needs_an_unavailable_insertion_is_no_feasible_reuse() {
+/// The two policies under which `CACHE` at destination 1 cannot be padded:
+/// the only allowed insertion is outside the gap, or padding is disabled.
+fn no_usable_insertion<'a>() -> [PlacementPolicy<'a>; 2] {
     let outside_gap = even_starts(AllowedInsertions::Boundaries(&[2]));
     let mut no_padding = PlacementPolicy::without_padding(10);
     no_padding.prepared_target_start_alignment = 2;
-    for policy in [outside_gap, no_padding] {
+    [outside_gap, no_padding]
+}
+
+#[test]
+fn an_unaligned_match_is_left_trimmed_when_it_cannot_be_padded() {
+    for policy in no_usable_insertion() {
+        let plan = analyze(&CONTEXT, &CACHE, 6, 1, policy).unwrap();
+        assert_eq!(spans(&plan), [(1, 2, 5)]);
+        assert_eq!(plan.ranges()[0].prepared_start, 2);
+        assert!(plan.placement().insertions.is_empty());
+        assert_eq!(
+            plan.placement().materialize(&CONTEXT, &CACHE).unwrap(),
+            CONTEXT
+        );
+    }
+}
+
+#[test]
+fn matches_that_neither_padding_nor_trimming_can_place_are_no_feasible_reuse() {
+    for mut policy in no_usable_insertion() {
+        // Trimming to an aligned start would leave 5 tokens.
+        policy.minimum_physical_reuse_tokens = 6;
         let plan = analyze(&CONTEXT, &CACHE, 6, 1, policy).unwrap();
         assert!(plan.ranges().is_empty());
         assert_eq!(plan.placement_status(), PlacementStatus::NoFeasibleReuse);
@@ -79,9 +101,20 @@ fn geometry_that_needs_an_unavailable_insertion_is_no_feasible_reuse() {
 }
 
 #[test]
+fn full_allowance_prefers_a_left_trim_to_an_expensive_pad() {
+    let mut policy = even_starts(AllowedInsertions::All);
+    policy.loss_allowance = LossAllowance::from_percent(100);
+    let plan = analyze(&CONTEXT, &CACHE, 6, 1, policy).unwrap();
+    assert_eq!(spans(&plan), [(1, 2, 5)]);
+    assert_eq!(plan.metrics().best_useful, 6);
+}
+
+#[test]
 fn full_allowance_prefers_no_reuse_to_an_expensive_pad() {
     let mut policy = even_starts(AllowedInsertions::All);
     policy.loss_allowance = LossAllowance::from_percent(100);
+    // No trimmed alternative: it would be shorter than the minimum.
+    policy.minimum_physical_reuse_tokens = 6;
     let plan = analyze(&CONTEXT, &CACHE, 6, 1, policy).unwrap();
     assert!(plan.ranges().is_empty());
     assert_eq!(plan.metrics().best_useful, 6);
@@ -164,8 +197,10 @@ fn variant_cap_returns_a_plan_or_reports_incomplete() {
     );
     assert_eq!(plan.covered_tokens(), 4);
 
-    // The only variant would need a pad to start at prepared position 1.
+    // The only variant would need a pad to start at prepared position 1, and
+    // trimming it to start there would leave fewer than 4 tokens.
     policy.minimum_prepared_reuse_start = 1;
+    policy.minimum_physical_reuse_tokens = 4;
     let error = analyze(&context, &cache, 4, 2, policy).unwrap_err();
     assert_eq!(
         (error.kind, error.stage),

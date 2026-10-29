@@ -1,18 +1,22 @@
-//! Predecessor index for the placement search.
+//! 2D predecessor index for placement search.
 //!
-//! A label can precede a variant in one of two ways:
+//! When extending a partial plan (`Label`) with a candidate `Variant`, a prior
+//! label relates to the variant in one of two ways:
 //!
-//! - **Clear of it:** the label ends at or before the variant's aligned start
-//!   in both target and source. The variant is placed unchanged, so every such
-//!   label with the same `(ranges, padding)` gives the same piece and only the
-//!   best coverage matters. [`Index::best_clear`] answers "best coverage with
-//!   `destination_end <= x` and `source_end <= y`" in O(log² V) per group,
-//!   from a Fenwick tree over source ends whose nodes hold a staircase of
-//!   destination ends.
-//! - **Overlapping it:** the label ends inside the variant's span in target or
-//!   source, so the variant is trimmed by an amount that depends on the
-//!   label. These labels are enumerated from two ordered sets by end
-//!   position; only labels ending inside the variant's span are visited.
+//! - **Clear (non-overlapping) predecessor:** The label ends at or before the
+//!   variant's aligned start in both target and source coordinates. Because a
+//!   clear predecessor does not force `fit()` to trim the variant, every clear
+//!   predecessor in the same `(ranges, padding)` group produces the exact same
+//!   placed piece. Only the predecessor with the highest `covered` total in
+//!   that 2D prefix region matters. [`Index::best_clear`] answers that query
+//!   (`destination_end <= max_end` and `source_end <= source_bound`) in
+//!   `O(log² V)` time per group using a Fenwick tree over variant source starts
+//!   whose nodes each maintain a Pareto staircase of `(destination_end, covered)`.
+//! - **Overlapping or adjacent predecessor:** The label ends inside the
+//!   variant's target or source span, so `fit()` must left-trim the variant by
+//!   an amount that depends on the predecessor's exact end position. Those
+//!   predecessors are stored in `BTreeMap`s keyed by `destination_end` and
+//!   `source_end` so only labels ending inside the variant's span are visited.
 
 use std::collections::{BTreeMap, HashMap};
 

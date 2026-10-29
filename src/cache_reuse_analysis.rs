@@ -152,8 +152,10 @@ fn cannot_match(context: &[u32], cache: &CacheView<'_>) -> bool {
     minimum > context.len() || minimum > cache.tokens.len()
 }
 
+/// The plan when there is nothing to place: search had no work, so it is
+/// complete.
 fn empty() -> PlacementOutcome {
-    PlacementOutcome::empty(0, crate::placement::PlacementStatus::NoFeasibleReuse)
+    PlacementOutcome::empty(0, crate::placement::PlacementStatus::Complete)
 }
 
 fn finish(

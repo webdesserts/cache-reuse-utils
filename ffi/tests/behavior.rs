@@ -108,12 +108,19 @@ fn the_pad_penalty_defaults_to_sixteen_when_padding_is_enabled() {
     config.max_prepared_tokens = 7;
     config.allow_all_insertions = true;
     config.loss_basis_points = 10_000;
-    // Four covered tokens do not repay the default 16-token pad cost.
+    // The default 16-token pad cost makes trimming one token to an aligned
+    // start the better plan.
+    let (_, result, _) = plan(Some(&config), 64, None);
+    assert_eq!((result.covered_tokens, result.insertion_count), (3, 0));
+    assert_eq!(result.ranges[0].prepared_start, 2);
+    // Without the trim, four covered tokens do not repay the default cost,
+    // but do repay a cost of 1.
+    config.minimum_physical_reuse_tokens = 4;
     let (_, result, _) = plan(Some(&config), 64, None);
     assert_eq!(result.range_count, 0);
     config.pad_penalty_tokens = 1;
     let (_, result, _) = plan(Some(&config), 64, None);
-    assert_eq!(result.covered_tokens, 4);
+    assert_eq!((result.covered_tokens, result.insertion_count), (4, 1));
 }
 
 #[test]

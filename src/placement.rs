@@ -616,9 +616,11 @@ pub struct PlacementMetrics {
 /// analysis returns an error instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlacementStatus {
-    /// Every derived variant was searched.
+    /// Every derived variant was searched. Also reported, with an empty plan,
+    /// when discovery found no match to place.
     Complete,
-    /// No non-empty placement was feasible; the plan is deliberately empty.
+    /// Matches were found but none could be placed under the policy; the
+    /// plan is deliberately empty.
     NoFeasibleReuse,
     /// Search stopped at the deadline.
     DeadlinePartial,

@@ -106,10 +106,14 @@ int main(void) {
     cfg.allowed_insertions = NULL;
     cfg.allowed_insertion_count = 0;
     memset(&r, 0, sizeof(r));
+    /* No insertion is allowed, so the match is left-trimmed to an aligned
+       prepared start instead of padded. */
     if (plan(insert_target, 6, insert_source, 4, &cfg, &r, NULL) != 0 ||
-        r.status != CACHE_REUSE_NO_FEASIBLE || r.range_count != 0) {
-        fprintf(stderr, "disallowed insertion was accepted: status=%u ranges=%u\n",
-                r.status, r.range_count);
+        r.status != CACHE_REUSE_COMPLETE || r.range_count != 1 ||
+        r.insertion_count != 0 || r.ranges[0].count != 3 ||
+        r.ranges[0].prepared_start != 2) {
+        fprintf(stderr, "disallowed insertion was not trimmed: status=%u ranges=%u insertions=%u\n",
+                r.status, r.range_count, r.insertion_count);
         return 1;
     }
     cfg = config_for(10);
