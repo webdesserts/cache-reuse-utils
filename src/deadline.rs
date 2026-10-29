@@ -122,7 +122,7 @@ impl TimerService {
     ) -> Result<DeadlineRegistration, TimerError> {
         self.register_with_spawn(deadline, signal, |service| {
             thread::Builder::new()
-                .name("scr-deadline".into())
+                .name("cache-reuse-deadline".into())
                 .spawn(move || run_worker(service))
                 .map(|_| ())
         })

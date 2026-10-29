@@ -11,7 +11,7 @@ item_types = ["constants", "structs", "functions"]
 renaming_overrides_prefixing = true
 
 [export.rename]
-ScrPlannerRange = "scr_planner_range"
-ScrPlannerInsertion = "scr_planner_insertion"
-ScrPlannerConfig = "scr_planner_config"
-ScrPlannerResult = "scr_planner_result"
+CacheReuseRange = "cache_reuse_range"
+CacheReuseInsertion = "cache_reuse_insertion"
+CacheReuseConfig = "cache_reuse_config"
+CacheReuseResult = "cache_reuse_result"

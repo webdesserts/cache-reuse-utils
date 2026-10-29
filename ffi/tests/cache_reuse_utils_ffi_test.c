@@ -2,8 +2,8 @@
 #include <stdio.h>
 #include <string.h>
 
-static scr_planner_config config_for(uint32_t k) {
-    scr_planner_config c;
+static cache_reuse_config config_for(uint32_t k) {
+    cache_reuse_config c;
     memset(&c, 0, sizeof(c));
     c.max_ranges = k;
     c.minimum_match_tokens = 1;
@@ -29,9 +29,9 @@ static scr_planner_config config_for(uint32_t k) {
 }
 
 static int plan(const int32_t *target, uint32_t tn, const int32_t *source, uint32_t sn,
-                scr_planner_config *cfg, scr_planner_result *r, bool (*cancel)(void *)) {
+                cache_reuse_config *cfg, cache_reuse_result *r, bool (*cancel)(void *)) {
     char err[256] = {0};
-    int rc = scr_planner_plan(target, tn, source, sn, 7, cfg, r, err, sizeof(err), cancel, NULL);
+    int rc = cache_reuse_plan(target, tn, source, sn, 7, cfg, r, err, sizeof(err), cancel, NULL);
     if (rc && err[0]) fprintf(stderr, "planner error: %s\n", err);
     return rc;
 }
@@ -41,11 +41,11 @@ static bool always_cancel(void *ud) { (void)ud; return true; }
 int main(void) {
     int32_t target[20] = {10,0,11,0,12,0,13,0,14,0,15,0,16,0,17,0,18,0,19,0};
     int32_t source[20] = {10,99,11,99,12,99,13,99,14,99,15,99,16,99,17,99,18,99,19,99};
-    scr_planner_config cfg = config_for(10);
-    scr_planner_result r;
+    cache_reuse_config cfg = config_for(10);
+    cache_reuse_result r;
     memset(&r, 0, sizeof(r));
     if (plan(target, 20, source, 20, &cfg, &r, NULL) != 0 ||
-        r.status != SCR_PLANNER_COMPLETE || r.range_count != 10 || r.covered_tokens != 10) {
+        r.status != CACHE_REUSE_COMPLETE || r.range_count != 10 || r.covered_tokens != 10) {
         fprintf(stderr, "ten-range plan failed status=%u ranges=%u covered=%u\n",
                 r.status, r.range_count, r.covered_tokens);
         return 1;
@@ -54,14 +54,14 @@ int main(void) {
     cfg.variant_limit = 1;
     memset(&r, 0, sizeof(r));
     if (plan(target, 20, source, 20, &cfg, &r, NULL) != 0 ||
-        r.status != SCR_PLANNER_VARIANT_LIMIT || r.range_count == 0) {
+        r.status != CACHE_REUSE_VARIANT_LIMIT || r.range_count == 0) {
         fprintf(stderr, "limited valid incumbent was not preserved: status=%u ranges=%u\n",
                 r.status, r.range_count);
         return 1;
     }
     cfg = config_for(11);
     memset(&r, 0, sizeof(r));
-    if (plan(target, 20, source, 20, &cfg, &r, NULL) == 0 || r.status != SCR_PLANNER_ERR_INVALID) {
+    if (plan(target, 20, source, 20, &cfg, &r, NULL) == 0 || r.status != CACHE_REUSE_ERR_INVALID) {
         fprintf(stderr, "K11 was not rejected\n");
         return 1;
     }
@@ -106,14 +106,14 @@ int main(void) {
     cfg.allowed_insertion_count = 0;
     memset(&r, 0, sizeof(r));
     if (plan(insert_target, 6, insert_source, 4, &cfg, &r, NULL) != 0 ||
-        r.status != SCR_PLANNER_NO_FEASIBLE || r.range_count != 0) {
+        r.status != CACHE_REUSE_NO_FEASIBLE || r.range_count != 0) {
         fprintf(stderr, "disallowed insertion was accepted: status=%u ranges=%u\n",
                 r.status, r.range_count);
         return 1;
     }
     cfg = config_for(10);
     memset(&r, 0, sizeof(r));
-    if (plan(NULL, 20, source, 20, &cfg, &r, NULL) == 0 || r.status != SCR_PLANNER_ERR_INVALID) {
+    if (plan(NULL, 20, source, 20, &cfg, &r, NULL) == 0 || r.status != CACHE_REUSE_ERR_INVALID) {
         fprintf(stderr, "null target was not rejected\n");
         return 1;
     }
@@ -124,14 +124,14 @@ int main(void) {
     int32_t negative[20] = {10,0,11,0,12,0,13,0,14,0,15,0,16,0,17,0,18,0,19,0};
     negative[3] = -1;
     memset(&r, 0, sizeof(r));
-    if (plan(target, 20, negative, 20, &cfg, &r, NULL) == 0 || r.status != SCR_PLANNER_ERR_INVALID) {
+    if (plan(target, 20, negative, 20, &cfg, &r, NULL) == 0 || r.status != CACHE_REUSE_ERR_INVALID) {
         fprintf(stderr, "negative token was not rejected\n");
         return 1;
     }
     cfg = config_for(10);
     cfg.budget_ms = 0;
     memset(&r, 0, sizeof(r));
-    if (plan(target, 20, source, 20, &cfg, &r, NULL) == 0 || r.status != SCR_PLANNER_ERR_BUDGET) {
+    if (plan(target, 20, source, 20, &cfg, &r, NULL) == 0 || r.status != CACHE_REUSE_ERR_BUDGET) {
         fprintf(stderr, "zero budget was not propagated\n");
         return 1;
     }
@@ -143,10 +143,10 @@ int main(void) {
     cfg = config_for(10);
     memset(&r, 0, sizeof(r));
     if (plan(target, 20, source, 20, &cfg, &r, always_cancel) == 0 ||
-        r.status != SCR_PLANNER_ERR_CANCELLED) {
+        r.status != CACHE_REUSE_ERR_CANCELLED) {
         fprintf(stderr, "cancel was not propagated\n");
         return 1;
     }
-    puts("scr_planner_ffi_test: ok");
+    puts("cache_reuse_utils_ffi_test: ok");
     return 0;
 }

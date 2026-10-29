@@ -2,7 +2,5 @@ cache-reuse-utils
 
 The planner core is an independent MIT-licensed work by Michael Mullins.
 
-The C ABI bridge in ffi/ was extracted from the DwarfStar/ds4 project and is
-distributed under its MIT license: Copyright (c) 2026 The ds4.c authors. The
-DwarfStar repository also contains separately noticed GGML and DeepSeek-derived
-material; no such material is included in this repository.
+Portions of the C ABI in ffi/ derive from ds4.c, Copyright (c) 2026 The ds4.c
+authors, used under the MIT License.

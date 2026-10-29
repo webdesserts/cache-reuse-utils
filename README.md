@@ -54,11 +54,11 @@ install native cache tensors or execute inference.
 
 ## C ABI
 
-The separate `ffi/` package is the model-independent C ABI boundary. It owns the
-`cache_reuse_utils_ffi` static library and uses the existing `scr_planner_*` C
-symbols and numeric status values. The canonical generated header is
-`ffi/include/cache_reuse_utils.h`; `scr_planner_ffi.h` is a compatibility
-include. Normal Rust and C builds do not require cbindgen.
+The separate `ffi/` package is the model-independent C ABI boundary. It builds
+the `cache_reuse_utils_ffi` static library, which exports `cache_reuse_plan` and
+the `cache_reuse_*` types and `CACHE_REUSE_*` constants declared in the
+generated header `ffi/include/cache_reuse_utils.h`. Normal Rust and C builds do
+not require cbindgen.
 
 This is one Cargo workspace with the safe core as its default member and the FFI
 crate as an explicit member. The workspace release profile uses
@@ -74,8 +74,8 @@ cargo build --release --locked -p cache-reuse-utils-ffi \
 
 `run-c-tests.sh` defaults to the workspace target at `<repo>/target`, and always
 builds and links the archive under the target directory passed as its first
-argument (or `CARGO_TARGET_DIR`). It does not fall back to any other archive. Link a C
-consumer with the canonical include path and the archive:
+argument (or `CARGO_TARGET_DIR`). Compiled C test binaries are written to
+`<target>/c-tests`. Link a C consumer with the include path and the archive:
 
 ```sh
 cc -std=c11 -Iffi/include consumer.c \
@@ -99,8 +99,7 @@ function returns 1 and writes a best-effort error, but cannot promise a populate
 `result.status`. Error buffers are best effort. This package adds no aliasing,
 thread-reentrancy, or broader ownership guarantee.
 
-`ffi/include/scr_planner_ffi.h` is only a compatibility include. The optional
-`tools/check-header.sh` requires cbindgen 0.29.4 and checks the canonical header
+The optional `tools/check-header.sh` requires cbindgen 0.29.4 and checks the canonical header
 against a temporary generation; it is not part of ordinary builds.
 
 ## Engine boundary
@@ -113,8 +112,7 @@ prove model-state equivalence or a qualified engine integration.
 ## Background
 
 SCR reuses already-computed context when a new request shares an exact span with
-it. Upstream Dwarfstar does not provide SCR by default; this series adds it
-through integration patches.
+it.
 
 References:
 
@@ -122,7 +120,7 @@ References:
   “Suffix Cache Reuse” —
   <https://arxiv.org/abs/2609.37725v1>; appendix
   <https://arxiv.org/html/2609.37725v1#A2>.
-- Astra’s Dwarfstar recipe, SCR chapter —
+- Astra’s SCR recipe —
   <https://tangled.org/astrra.space/ds4-recipe/blob/main/README.md>; chapter
   <https://next.tangled.org/astrra.space/ds4-recipe/blob/main/13-suffix-cache-reuse.md>.
   Its target runtime and numbers are inspiration, not transferable claims.

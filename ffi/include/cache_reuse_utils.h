@@ -7,29 +7,29 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define SCR_PLANNER_COMPLETE 0
+#define CACHE_REUSE_COMPLETE 0
 
-#define SCR_PLANNER_NO_FEASIBLE 1
+#define CACHE_REUSE_NO_FEASIBLE 1
 
-#define SCR_PLANNER_DEADLINE_PARTIAL 2
+#define CACHE_REUSE_DEADLINE_PARTIAL 2
 
-#define SCR_PLANNER_VARIANT_LIMIT 3
+#define CACHE_REUSE_VARIANT_LIMIT 3
 
-#define SCR_PLANNER_STATE_LIMIT 4
+#define CACHE_REUSE_STATE_LIMIT 4
 
-#define SCR_PLANNER_ERR_INVALID 10
+#define CACHE_REUSE_ERR_INVALID 10
 
-#define SCR_PLANNER_ERR_BUDGET 11
+#define CACHE_REUSE_ERR_BUDGET 11
 
-#define SCR_PLANNER_ERR_CANCELLED 12
+#define CACHE_REUSE_ERR_CANCELLED 12
 
-#define SCR_PLANNER_ERR_ADMISSION 13
+#define CACHE_REUSE_ERR_ADMISSION 13
 
-#define SCR_PLANNER_ERR_PANIC 14
+#define CACHE_REUSE_ERR_PANIC 14
 
-#define SCR_PLANNER_MAX_RANGES 10
+#define CACHE_REUSE_MAX_RANGES 10
 
-#define SCR_PLANNER_MAX_INSERTIONS 10
+#define CACHE_REUSE_MAX_INSERTIONS 10
 
 typedef struct {
   uint32_t max_ranges;
@@ -52,20 +52,20 @@ typedef struct {
   bool allow_all_insertions;
   const uint32_t *allowed_insertions;
   uint32_t allowed_insertion_count;
-} scr_planner_config;
+} cache_reuse_config;
 
 typedef struct {
   uint32_t source_start;
   uint32_t destination_start;
   uint32_t count;
   uint32_t prepared_start;
-} scr_planner_range;
+} cache_reuse_range;
 
 typedef struct {
   uint32_t before_target_index;
   uint32_t token;
   uint32_t count;
-} scr_planner_insertion;
+} cache_reuse_insertion;
 
 typedef struct {
   uint32_t status;
@@ -83,21 +83,21 @@ typedef struct {
   bool discovery_entered;
   bool search_entered;
   bool timing_known;
-  scr_planner_range ranges[SCR_PLANNER_MAX_RANGES];
-  scr_planner_insertion insertions[SCR_PLANNER_MAX_INSERTIONS];
-} scr_planner_result;
+  cache_reuse_range ranges[CACHE_REUSE_MAX_RANGES];
+  cache_reuse_insertion insertions[CACHE_REUSE_MAX_INSERTIONS];
+} cache_reuse_result;
 
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
 
-int32_t scr_planner_plan(const int32_t *target,
+int32_t cache_reuse_plan(const int32_t *target,
                          uint32_t target_len,
                          const int32_t *source,
                          uint32_t source_len,
                          uint64_t cache_identity,
-                         const scr_planner_config *config,
-                         scr_planner_result *result,
+                         const cache_reuse_config *config,
+                         cache_reuse_result *result,
                          char *error,
                          size_t error_len,
                          bool (*cancel)(void*),

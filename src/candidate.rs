@@ -1,9 +1,9 @@
 //! Candidate ranges and planner admission bounds.
 
-/// Maximum selected chain slots. Raised to 10 for the Ren deployment; this is
-/// still a planner-admission bound, not a native execution promise.
+/// Maximum number of final reused ranges a plan may contain (the largest
+/// accepted `k`).
 pub const MAX_RANGES: u32 = 10;
-/// Maximum candidate pool size (`DS4_SCR_DENSE_RANGES_MAX`).
+/// Maximum number of discovered candidate matches retained for search.
 pub(crate) const MAX_CANDIDATES: usize = 4096;
 
 /// One reuse candidate in logical token coordinates.

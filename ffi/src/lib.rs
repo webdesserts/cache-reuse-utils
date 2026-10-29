@@ -14,26 +14,26 @@ use cache_reuse_utils::{
     PlacementStatus, PlanError,
 };
 
-pub const SCR_PLANNER_COMPLETE: u32 = 0;
-pub const SCR_PLANNER_NO_FEASIBLE: u32 = 1;
-pub const SCR_PLANNER_DEADLINE_PARTIAL: u32 = 2;
-pub const SCR_PLANNER_VARIANT_LIMIT: u32 = 3;
-pub const SCR_PLANNER_STATE_LIMIT: u32 = 4;
-pub const SCR_PLANNER_ERR_INVALID: u32 = 10;
-pub const SCR_PLANNER_ERR_BUDGET: u32 = 11;
-pub const SCR_PLANNER_ERR_CANCELLED: u32 = 12;
-pub const SCR_PLANNER_ERR_ADMISSION: u32 = 13;
-pub const SCR_PLANNER_ERR_PANIC: u32 = 14;
+pub const CACHE_REUSE_COMPLETE: u32 = 0;
+pub const CACHE_REUSE_NO_FEASIBLE: u32 = 1;
+pub const CACHE_REUSE_DEADLINE_PARTIAL: u32 = 2;
+pub const CACHE_REUSE_VARIANT_LIMIT: u32 = 3;
+pub const CACHE_REUSE_STATE_LIMIT: u32 = 4;
+pub const CACHE_REUSE_ERR_INVALID: u32 = 10;
+pub const CACHE_REUSE_ERR_BUDGET: u32 = 11;
+pub const CACHE_REUSE_ERR_CANCELLED: u32 = 12;
+pub const CACHE_REUSE_ERR_ADMISSION: u32 = 13;
+pub const CACHE_REUSE_ERR_PANIC: u32 = 14;
 /// Maximum selected ranges emitted by the C ABI.
-pub const SCR_PLANNER_MAX_RANGES: usize = 10;
+pub const CACHE_REUSE_MAX_RANGES: usize = 10;
 /// Maximum insertion records emitted by the C ABI.
-pub const SCR_PLANNER_MAX_INSERTIONS: usize = 10;
-const _: () = assert!(SCR_PLANNER_MAX_RANGES == cache_reuse_utils::MAX_RANGES as usize);
-const _: () = assert!(SCR_PLANNER_MAX_INSERTIONS == 10);
+pub const CACHE_REUSE_MAX_INSERTIONS: usize = 10;
+const _: () = assert!(CACHE_REUSE_MAX_RANGES == cache_reuse_utils::MAX_RANGES as usize);
+const _: () = assert!(CACHE_REUSE_MAX_INSERTIONS == 10);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct ScrPlannerRange {
+pub struct CacheReuseRange {
     pub source_start: u32,
     pub destination_start: u32,
     pub count: u32,
@@ -42,7 +42,7 @@ pub struct ScrPlannerRange {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct ScrPlannerInsertion {
+pub struct CacheReuseInsertion {
     pub before_target_index: u32,
     pub token: u32,
     pub count: u32,
@@ -50,7 +50,7 @@ pub struct ScrPlannerInsertion {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct ScrPlannerConfig {
+pub struct CacheReuseConfig {
     pub max_ranges: u32,
     pub minimum_match_tokens: u32,
     pub minimum_physical_reuse_tokens: u32,
@@ -74,7 +74,7 @@ pub struct ScrPlannerConfig {
 }
 
 #[repr(C)]
-pub struct ScrPlannerResult {
+pub struct CacheReuseResult {
     pub status: u32,
     pub covered_tokens: u32,
     pub inserted_padding: u32,
@@ -90,8 +90,8 @@ pub struct ScrPlannerResult {
     pub discovery_entered: bool,
     pub search_entered: bool,
     pub timing_known: bool,
-    pub ranges: [ScrPlannerRange; SCR_PLANNER_MAX_RANGES],
-    pub insertions: [ScrPlannerInsertion; SCR_PLANNER_MAX_INSERTIONS],
+    pub ranges: [CacheReuseRange; CACHE_REUSE_MAX_RANGES],
+    pub insertions: [CacheReuseInsertion; CACHE_REUSE_MAX_INSERTIONS],
 }
 
 fn set_error(buffer: *mut c_char, len: usize, message: &str) {
@@ -108,11 +108,11 @@ fn set_error(buffer: *mut c_char, len: usize, message: &str) {
 
 fn status_of_plan(status: PlacementStatus) -> u32 {
     match status {
-        PlacementStatus::Complete => SCR_PLANNER_COMPLETE,
-        PlacementStatus::NoFeasibleReuse => SCR_PLANNER_NO_FEASIBLE,
-        PlacementStatus::DeadlinePartial => SCR_PLANNER_DEADLINE_PARTIAL,
-        PlacementStatus::VariantLimitReached => SCR_PLANNER_VARIANT_LIMIT,
-        PlacementStatus::StateLimitReached => SCR_PLANNER_STATE_LIMIT,
+        PlacementStatus::Complete => CACHE_REUSE_COMPLETE,
+        PlacementStatus::NoFeasibleReuse => CACHE_REUSE_NO_FEASIBLE,
+        PlacementStatus::DeadlinePartial => CACHE_REUSE_DEADLINE_PARTIAL,
+        PlacementStatus::VariantLimitReached => CACHE_REUSE_VARIANT_LIMIT,
+        PlacementStatus::StateLimitReached => CACHE_REUSE_STATE_LIMIT,
     }
 }
 
@@ -140,22 +140,22 @@ impl From<PlanError> for BridgeError {
 
 fn error_status(error: &BridgeError) -> u32 {
     match error {
-        BridgeError::Invalid(_) => SCR_PLANNER_ERR_INVALID,
+        BridgeError::Invalid(_) => CACHE_REUSE_ERR_INVALID,
         BridgeError::Plan(value) => error_status_plan(value),
     }
 }
 
 fn error_status_plan(error: &PlanError) -> u32 {
     match error {
-        PlanError::Cancelled { .. } => SCR_PLANNER_ERR_CANCELLED,
-        PlanError::BudgetExhausted { .. } => SCR_PLANNER_ERR_BUDGET,
+        PlanError::Cancelled { .. } => CACHE_REUSE_ERR_CANCELLED,
+        PlanError::BudgetExhausted { .. } => CACHE_REUSE_ERR_BUDGET,
         PlanError::AdmissionDenied { .. } | PlanError::PlacementIncomplete { .. } => {
-            SCR_PLANNER_ERR_ADMISSION
+            CACHE_REUSE_ERR_ADMISSION
         }
         PlanError::InvalidInput { .. } | PlanError::InvalidPlacementPolicy { .. } => {
-            SCR_PLANNER_ERR_INVALID
+            CACHE_REUSE_ERR_INVALID
         }
-        PlanError::Invariant { .. } => SCR_PLANNER_ERR_PANIC,
+        PlanError::Invariant { .. } => CACHE_REUSE_ERR_PANIC,
     }
 }
 
@@ -180,7 +180,7 @@ unsafe fn copy_tokens(pointer: *const i32, len: u32, what: &str) -> Result<Vec<u
     Ok(output)
 }
 
-unsafe fn copy_allowed(config: &ScrPlannerConfig, target_len: usize) -> Result<Vec<u32>, String> {
+unsafe fn copy_allowed(config: &CacheReuseConfig, target_len: usize) -> Result<Vec<u32>, String> {
     if config.allow_all_insertions {
         let mut output = Vec::new();
         output
@@ -211,7 +211,7 @@ unsafe fn copy_allowed(config: &ScrPlannerConfig, target_len: usize) -> Result<V
     Ok(output)
 }
 
-fn apply_timing(result: &mut ScrPlannerResult, timing: AnalysisTiming) {
+fn apply_timing(result: &mut CacheReuseResult, timing: AnalysisTiming) {
     result.elapsed_ns = u64::try_from(timing.elapsed().as_nanos()).unwrap_or(u64::MAX);
     result.preparation_ns = u64::try_from(timing.preparation().as_nanos()).unwrap_or(u64::MAX);
     result.discovery_ns = timing
@@ -239,10 +239,10 @@ fn plan_error_timing(error: &PlanError) -> Option<AnalysisTiming> {
     }
 }
 
-fn apply_result(result: &mut ScrPlannerResult, plan: cache_reuse_utils::ReusePlan) -> bool {
+fn apply_result(result: &mut CacheReuseResult, plan: cache_reuse_utils::ReusePlan) -> bool {
     let ranges = plan.placement().ranges.as_slice();
     let insertions = plan.placement().insertions.as_slice();
-    if ranges.len() > SCR_PLANNER_MAX_RANGES || insertions.len() > SCR_PLANNER_MAX_INSERTIONS {
+    if ranges.len() > CACHE_REUSE_MAX_RANGES || insertions.len() > CACHE_REUSE_MAX_INSERTIONS {
         return false;
     }
     let metrics = plan.metrics();
@@ -256,7 +256,7 @@ fn apply_result(result: &mut ScrPlannerResult, plan: cache_reuse_utils::ReusePla
     result.insertion_count = insertions.len() as u32;
     apply_timing(result, plan.timing());
     for (dst, src) in result.ranges.iter_mut().zip(ranges) {
-        *dst = ScrPlannerRange {
+        *dst = CacheReuseRange {
             source_start: src.source_start,
             destination_start: src.destination_start,
             count: src.token_count,
@@ -264,7 +264,7 @@ fn apply_result(result: &mut ScrPlannerResult, plan: cache_reuse_utils::ReusePla
         };
     }
     for (dst, src) in result.insertions.iter_mut().zip(insertions) {
-        *dst = ScrPlannerInsertion {
+        *dst = CacheReuseInsertion {
             before_target_index: src.before_target_index,
             token: src.token,
             count: src.count,
@@ -284,14 +284,14 @@ fn apply_result(result: &mut ScrPlannerResult, plan: cache_reuse_utils::ReusePla
 /// present, must be callable with `cancel_ud` and must not unwind. No input or
 /// output pointer is retained after return.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn scr_planner_plan(
+pub unsafe extern "C" fn cache_reuse_plan(
     target: *const i32,
     target_len: u32,
     source: *const i32,
     source_len: u32,
     cache_identity: u64,
-    config: *const ScrPlannerConfig,
-    result: *mut ScrPlannerResult,
+    config: *const CacheReuseConfig,
+    result: *mut CacheReuseResult,
     error: *mut c_char,
     error_len: usize,
     cancel: Option<unsafe extern "C" fn(*mut c_void) -> bool>,
@@ -303,8 +303,8 @@ pub unsafe extern "C" fn scr_planner_plan(
     }
     let config = unsafe { &*config };
     let result_ref = unsafe { &mut *result };
-    *result_ref = ScrPlannerResult {
-        status: SCR_PLANNER_ERR_INVALID,
+    *result_ref = CacheReuseResult {
+        status: CACHE_REUSE_ERR_INVALID,
         covered_tokens: 0,
         inserted_padding: 0,
         prepared_tokens: 0,
@@ -319,8 +319,8 @@ pub unsafe extern "C" fn scr_planner_plan(
         discovery_entered: false,
         search_entered: false,
         timing_known: false,
-        ranges: [empty_range2(); SCR_PLANNER_MAX_RANGES],
-        insertions: [empty_insertion2(); SCR_PLANNER_MAX_INSERTIONS],
+        ranges: [empty_range2(); CACHE_REUSE_MAX_RANGES],
+        insertions: [empty_insertion2(); CACHE_REUSE_MAX_INSERTIONS],
     };
     let deadline = match Instant::now().checked_add(Duration::from_millis(config.budget_ms as u64))
     {
@@ -338,7 +338,7 @@ pub unsafe extern "C" fn scr_planner_plan(
                 return Err("input length exceeds u32".into());
             }
             let allowed = unsafe { copy_allowed(config, target.len()) }?;
-            if config.max_ranges == 0 || config.max_ranges > SCR_PLANNER_MAX_RANGES as u32 {
+            if config.max_ranges == 0 || config.max_ranges > CACHE_REUSE_MAX_RANGES as u32 {
                 return Err("invalid max_ranges".into());
             }
             let pad_token = if config.pad_token < 0 {
@@ -390,7 +390,7 @@ pub unsafe extern "C" fn scr_planner_plan(
             if apply_result(result_ref, plan) {
                 0
             } else {
-                result_ref.status = SCR_PLANNER_ERR_INVALID;
+                result_ref.status = CACHE_REUSE_ERR_INVALID;
                 set_error(error, error_len, "planner result exceeds ABI bounds");
                 1
             }
@@ -410,23 +410,23 @@ pub unsafe extern "C" fn scr_planner_plan(
             1
         }
         Err(_) => {
-            result_ref.status = SCR_PLANNER_ERR_PANIC;
+            result_ref.status = CACHE_REUSE_ERR_PANIC;
             set_error(error, error_len, "planner panicked");
             1
         }
     }
 }
 
-fn empty_range2() -> ScrPlannerRange {
-    ScrPlannerRange {
+fn empty_range2() -> CacheReuseRange {
+    CacheReuseRange {
         source_start: 0,
         destination_start: 0,
         count: 0,
         prepared_start: 0,
     }
 }
-fn empty_insertion2() -> ScrPlannerInsertion {
-    ScrPlannerInsertion {
+fn empty_insertion2() -> CacheReuseInsertion {
+    CacheReuseInsertion {
         before_target_index: 0,
         token: 0,
         count: 0,
