@@ -1,7 +1,9 @@
 use super::*;
 use crate::candidate::{CandidateRange, MAX_RANGES};
 use crate::placement::LossAllowance;
-use crate::timing::DeadlineClock;
+use crate::timing::Stopper;
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 fn range(source_start: u32, destination_start: u32, token_count: u32) -> CandidateRange {
@@ -12,9 +14,30 @@ fn range(source_start: u32, destination_start: u32, token_count: u32) -> Candida
     }
 }
 
-fn clock<'a>(deadline: Instant, cancel: &'a mut dyn FnMut() -> bool) -> DeadlineClock<'a> {
+fn clock<'a>(deadline: Instant, cancel: &'a mut dyn FnMut() -> bool) -> Stopper<'a> {
     let base = Instant::now();
-    DeadlineClock::with_clock(base, deadline, move || base, cancel)
+    Stopper::with_clock(deadline, cancel, move |_| base)
+}
+
+/// Manual deadline: the clock reads as expired once `expire` is called.
+#[derive(Clone, Default)]
+struct Expiry(Rc<Cell<bool>>);
+
+impl Expiry {
+    fn expire(&self) {
+        self.0.set(true);
+    }
+}
+
+fn expiring_clock<'a>(
+    base: Instant,
+    expiry: Expiry,
+    cancel: &'a mut dyn FnMut() -> bool,
+) -> Stopper<'a> {
+    let deadline = base + Duration::from_secs(5);
+    Stopper::with_clock(deadline, cancel, move |_| {
+        if expiry.0.get() { deadline } else { base }
+    })
 }
 
 fn run_at(
@@ -154,7 +177,7 @@ fn state_cap_without_a_plan_returns_a_limiter_error() {
 #[test]
 fn deadline_publishes_exact_10_before_later_11() {
     let base = Instant::now();
-    let signal = crate::deadline::DeadlineSignal::new();
+    let signal = Expiry::default();
     let signal_for_cancel = signal.clone();
     let mut calls = 0u64;
     let mut cancel = move || {
@@ -164,13 +187,7 @@ fn deadline_publishes_exact_10_before_later_11() {
         }
         false
     };
-    let mut clock = DeadlineClock::with_clock_signal(
-        base,
-        base + Duration::from_secs(5),
-        move || base,
-        signal,
-        &mut cancel,
-    );
+    let mut clock = expiring_clock(base, signal, &mut cancel);
     let policy = PlacementPolicy::without_padding(20);
     let outcome = search(
         20,
@@ -191,7 +208,7 @@ fn deadline_publishes_exact_10_before_later_11() {
 #[test]
 fn deadline_publishes_coalesced_10() {
     let base = Instant::now();
-    let signal = crate::deadline::DeadlineSignal::new();
+    let signal = Expiry::default();
     let signal_for_cancel = signal.clone();
     let mut calls = 0u64;
     let mut cancel = move || {
@@ -201,13 +218,7 @@ fn deadline_publishes_coalesced_10() {
         }
         false
     };
-    let mut clock = DeadlineClock::with_clock_signal(
-        base,
-        base + Duration::from_secs(5),
-        move || base,
-        signal,
-        &mut cancel,
-    );
+    let mut clock = expiring_clock(base, signal, &mut cancel);
     let policy = PlacementPolicy::without_padding(20);
     let outcome = search(
         20,
@@ -227,7 +238,7 @@ fn deadline_publishes_coalesced_10() {
 #[test]
 fn deadline_during_rejected_trim_rectangle_is_budget_without_search() {
     let base = Instant::now();
-    let signal = crate::deadline::DeadlineSignal::new();
+    let signal = Expiry::default();
     let signal_for_cancel = signal.clone();
     let mut calls = 0u64;
     let mut cancel = move || {
@@ -237,13 +248,7 @@ fn deadline_during_rejected_trim_rectangle_is_budget_without_search() {
         }
         false
     };
-    let mut clock = DeadlineClock::with_clock_signal(
-        base,
-        base + Duration::from_secs(5),
-        move || base,
-        signal,
-        &mut cancel,
-    );
+    let mut clock = expiring_clock(base, signal, &mut cancel);
     let mut policy = PlacementPolicy::without_padding(6001);
     policy.max_trim_left = 6000;
     policy.max_trim_right = 6000;
@@ -258,7 +263,7 @@ fn deadline_during_rejected_trim_rectangle_is_budget_without_search() {
 #[test]
 fn cancellation_during_rejected_trim_rectangle_wins() {
     let base = Instant::now();
-    let signal = crate::deadline::DeadlineSignal::new();
+    let signal = Expiry::default();
     let signal_for_cancel = signal.clone();
     let mut calls = 0u64;
     let mut cancel = move || {
@@ -270,13 +275,7 @@ fn cancellation_during_rejected_trim_rectangle_wins() {
             false
         }
     };
-    let mut clock = DeadlineClock::with_clock_signal(
-        base,
-        base + Duration::from_secs(5),
-        move || base,
-        signal,
-        &mut cancel,
-    );
+    let mut clock = expiring_clock(base, signal, &mut cancel);
     let mut policy = PlacementPolicy::without_padding(6001);
     policy.max_trim_left = 6000;
     policy.max_trim_right = 6000;
@@ -635,7 +634,7 @@ fn independent_select(
 #[test]
 fn deadline_after_completed_placement_returns_best_partial_plan() {
     let base = Instant::now();
-    let signal = crate::deadline::DeadlineSignal::new();
+    let signal = Expiry::default();
     let signal_for_cancel = signal.clone();
     let mut calls = 0u64;
     let mut cancel = move || {
@@ -645,13 +644,7 @@ fn deadline_after_completed_placement_returns_best_partial_plan() {
         }
         false
     };
-    let mut clock = DeadlineClock::with_clock_signal(
-        base,
-        base + Duration::from_secs(5),
-        move || base,
-        signal,
-        &mut cancel,
-    );
+    let mut clock = expiring_clock(base, signal, &mut cancel);
     let policy = PlacementPolicy::without_padding(20);
     let matches = [range(0, 0, 4), range(6, 6, 5)];
     match search(20, &matches, 1, &policy, &mut clock) {
@@ -666,16 +659,10 @@ fn deadline_after_completed_placement_returns_best_partial_plan() {
 #[test]
 fn hundred_percent_without_a_completed_plan_still_reports_budget() {
     let base = Instant::now();
-    let signal = crate::deadline::DeadlineSignal::new();
+    let signal = Expiry::default();
     signal.expire();
     let mut cancel = || false;
-    let mut clock = DeadlineClock::with_clock_signal(
-        base,
-        base + Duration::from_secs(5),
-        move || base,
-        signal,
-        &mut cancel,
-    );
+    let mut clock = expiring_clock(base, signal, &mut cancel);
     let mut policy = PlacementPolicy::without_padding(20);
     policy.loss_allowance = LossAllowance::from_basis_points(10_000);
     policy.max_new_padding = 1;
@@ -689,16 +676,10 @@ fn hundred_percent_without_a_completed_plan_still_reports_budget() {
 #[test]
 fn early_deadline_before_a_valid_plan_is_budget_not_empty() {
     let base = Instant::now();
-    let signal = crate::deadline::DeadlineSignal::new();
+    let signal = Expiry::default();
     signal.expire();
     let mut cancel = || false;
-    let mut clock = DeadlineClock::with_clock_signal(
-        base,
-        base + Duration::from_secs(5),
-        move || base,
-        signal,
-        &mut cancel,
-    );
+    let mut clock = expiring_clock(base, signal, &mut cancel);
     let policy = PlacementPolicy::without_padding(20);
     assert!(matches!(
         search(20, &[range(0, 0, 4)], 1, &policy, &mut clock),

@@ -1,27 +1,22 @@
-//! Bounded exact maximal-match discovery over one logical cache source.
-
-use std::mem::size_of;
+//! Exact maximal-match discovery over one cache source.
 
 use crate::cache_view::CacheView;
 use crate::candidate::{CandidateRange, MAX_CANDIDATES};
-use crate::error::AdmissionDeniedReason;
-use crate::timing::{CheckOutcome, DeadlineClock};
+use crate::error::{AdmissionDeniedReason, PlanErrorKind};
+use crate::timing::Stopper;
 
-/// Each input token slice is capped at 1,048,576 entries to bound index work
-/// and memory in this Rust planner. This is not a native execution limit.
+/// Each input is capped at 1,048,576 tokens to bound index time and memory.
+/// This is a planner limit, not a native execution limit.
 pub(crate) const MAX_DISCOVERY_TOKENS: usize = 1 << 20;
-/// Modeled peak discovery payload; borrowed token slices are not included.
-pub(crate) const MAX_DISCOVERY_BYTES: u64 = 32 * 1024 * 1024;
 
 const HASH_BASE: u64 = 257;
 
-/// Whether discovery enumerated all qualifying maximal matches or stopped at
-/// the candidate capacity.
+/// Whether discovery considered every qualifying maximal match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscoveryStatus {
-    /// All qualifying maximal matches under the declared rule were considered.
+    /// All qualifying maximal matches were considered.
     Complete,
-    /// More qualifying matches existed after the candidate capacity was filled.
+    /// More qualifying matches existed than the candidate capacity.
     CandidateLimitReached,
 }
 
@@ -31,49 +26,24 @@ struct Seed {
     source: u32,
 }
 
-#[derive(Debug)]
-pub(crate) enum DiscoveryError {
-    Cancelled,
-    BudgetExhausted,
-    AdmissionDenied(AdmissionDeniedReason),
-    Invariant(&'static str),
-}
-
 pub(crate) struct DiscoveryOutcome {
     pub ranges: Vec<CandidateRange>,
     pub status: DiscoveryStatus,
-}
-
-fn poll(clock: &mut DeadlineClock<'_>) -> Result<(), DiscoveryError> {
-    match clock.check() {
-        CheckOutcome::Continue => Ok(()),
-        CheckOutcome::DeadlineReached => Err(DiscoveryError::BudgetExhausted),
-        CheckOutcome::Cancelled => Err(DiscoveryError::Cancelled),
-    }
 }
 
 fn seed_key(seed: &Seed) -> (u64, u32) {
     (seed.hash, seed.source)
 }
 
-/// Accumulate an attempted modeled component. On overflow the attempted total
-/// saturates at `u64::MAX`; on failure the caller reports the attempted subtotal
-/// that exceeded the limit, not the previous under-limit value.
-fn seed_fits(buffer: &mut u64, bytes: u64) -> bool {
-    let attempted = buffer.saturating_add(bytes);
-    *buffer = attempted;
-    attempted <= MAX_DISCOVERY_BYTES
-}
-
 fn window_hash(
     tokens: &[u32],
     start: usize,
     minimum: usize,
-    clock: &mut DeadlineClock<'_>,
-) -> Result<u64, DiscoveryError> {
+    stopper: &mut Stopper<'_>,
+) -> Result<u64, PlanErrorKind> {
     let mut hash = 0u64;
     for token in &tokens[start..start + minimum] {
-        poll(clock)?;
+        stopper.tick()?;
         hash = hash.wrapping_mul(HASH_BASE).wrapping_add(*token as u64 + 1);
     }
     Ok(hash)
@@ -85,31 +55,26 @@ fn update_hash(hash: u64, outgoing: u32, incoming: u32, power: u64) -> u64 {
         .wrapping_sub((outgoing as u64 + 1).wrapping_mul(power))
 }
 
-/// Sort seeds by `(hash, source)`. The algorithm is deterministic and checks
-/// cancellation/deadline during partitioning rather than leaving a million-row
-/// sort uninterruptible.
-fn sort_seeds(seeds: &mut [Seed], clock: &mut DeadlineClock<'_>) -> Result<(), DiscoveryError> {
-    fn insertion(slice: &mut [Seed], clock: &mut DeadlineClock<'_>) -> Result<(), DiscoveryError> {
+/// Sort seeds by `(hash, source)`, checking for a stop while partitioning.
+fn sort_seeds(seeds: &mut [Seed], stopper: &mut Stopper<'_>) -> Result<(), PlanErrorKind> {
+    fn insertion(slice: &mut [Seed], stopper: &mut Stopper<'_>) -> Result<(), PlanErrorKind> {
         for i in 1..slice.len() {
             let mut j = i;
             while j > 0 && seed_key(&slice[j - 1]) > seed_key(&slice[j]) {
                 slice.swap(j - 1, j);
                 j -= 1;
-                poll(clock)?;
+                stopper.tick()?;
             }
-            poll(clock)?;
+            stopper.tick()?;
         }
         Ok(())
     }
 
-    fn quicksort(
-        mut slice: &mut [Seed],
-        clock: &mut DeadlineClock<'_>,
-    ) -> Result<(), DiscoveryError> {
+    fn quicksort(mut slice: &mut [Seed], stopper: &mut Stopper<'_>) -> Result<(), PlanErrorKind> {
         const SMALL: usize = 24;
         loop {
             if slice.len() <= SMALL {
-                return insertion(slice, clock);
+                return insertion(slice, stopper);
             }
             let mid = slice.len() / 2;
             let pivot = seed_key(&slice[mid]);
@@ -128,21 +93,21 @@ fn sort_seeds(seeds: &mut [Seed], clock: &mut DeadlineClock<'_>) -> Result<(), D
                 } else {
                     equal += 1;
                 }
-                poll(clock)?;
+                stopper.tick()?;
             }
-            // Recurse into the smaller partition and loop over the larger one.
-            // Depth is therefore O(log N), independent of ordering and deadline.
+            // Recurse into the smaller partition and loop over the larger one,
+            // so recursion depth is O(log N).
             if less <= slice.len() - greater {
-                quicksort(&mut slice[..less], clock)?;
+                quicksort(&mut slice[..less], stopper)?;
                 slice = &mut slice[greater..];
             } else {
-                quicksort(&mut slice[greater..], clock)?;
+                quicksort(&mut slice[greater..], stopper)?;
                 slice = &mut slice[..less];
             }
         }
     }
 
-    quicksort(seeds, clock)
+    quicksort(seeds, stopper)
 }
 
 fn exact_prefix(
@@ -151,10 +116,10 @@ fn exact_prefix(
     target: &[u32],
     target_start: usize,
     minimum: usize,
-    clock: &mut DeadlineClock<'_>,
-) -> Result<bool, DiscoveryError> {
+    stopper: &mut Stopper<'_>,
+) -> Result<bool, PlanErrorKind> {
     for offset in 0..minimum {
-        poll(clock)?;
+        stopper.tick()?;
         if source[source_start + offset] != target[target_start + offset] {
             return Ok(false);
         }
@@ -168,11 +133,11 @@ fn extend_match(
     target: &[u32],
     target_start: usize,
     minimum: usize,
-    clock: &mut DeadlineClock<'_>,
-) -> Result<(usize, usize, usize), DiscoveryError> {
+    stopper: &mut Stopper<'_>,
+) -> Result<(usize, usize, usize), PlanErrorKind> {
     let mut left = 0usize;
     while source_start > left && target_start > left {
-        poll(clock)?;
+        stopper.tick()?;
         if source[source_start - left - 1] != target[target_start - left - 1] {
             break;
         }
@@ -180,7 +145,7 @@ fn extend_match(
     }
     let mut right = minimum;
     while source_start + right < source.len() && target_start + right < target.len() {
-        poll(clock)?;
+        stopper.tick()?;
         if source[source_start + right] != target[target_start + right] {
             break;
         }
@@ -189,91 +154,40 @@ fn extend_match(
     Ok((source_start - left, target_start - left, left + right))
 }
 
-/// Discover every maximal exact match at or above `cache.minimum_match_tokens`.
+/// Discover every maximal exact match at least `cache.minimum_match_tokens`
+/// long.
 ///
-/// Seeds exist at every logical source and target position; there is no native
-/// parity/8 stride. Hash equality is only a filter: every seed pair is verified
-/// token by token. A per-diagonal coverage end suppresses duplicate discoveries
-/// from windows inside the same maximal run. Candidate capacity is the only
-/// intentional early stop and is reported in [`DiscoveryStatus`].
+/// Every source and target position is a seed. Hash equality is only a
+/// filter: each seed pair is verified token by token. A per-diagonal coverage
+/// end skips windows inside an already-found maximal run. The caller has
+/// already rejected inputs that cannot match.
 pub(crate) fn discover(
     context: &[u32],
     cache: CacheView<'_>,
-    clock: &mut DeadlineClock<'_>,
-) -> Result<DiscoveryOutcome, DiscoveryError> {
+    stopper: &mut Stopper<'_>,
+) -> Result<DiscoveryOutcome, PlanErrorKind> {
     let minimum = cache.minimum_match_tokens as usize;
     let source = cache.tokens;
-    if minimum == 0
-        || source.is_empty()
-        || context.is_empty()
-        || minimum > source.len()
-        || minimum > context.len()
-    {
-        return Ok(DiscoveryOutcome {
-            ranges: Vec::new(),
-            status: DiscoveryStatus::Complete,
-        });
-    }
-
     let source_windows = source.len() - minimum + 1;
-    let covered_len = source
-        .len()
-        .checked_add(context.len())
-        .and_then(|len| len.checked_add(1))
-        .ok_or(DiscoveryError::Invariant(
-            "discovery coordinate length overflows",
-        ))?;
-    let mut modeled = 0u64;
-    if !seed_fits(
-        &mut modeled,
-        (source_windows as u64)
-            .checked_mul(size_of::<Seed>() as u64)
-            .ok_or(DiscoveryError::Invariant("discovery seed bytes overflow"))?,
-    ) || !seed_fits(
-        &mut modeled,
-        (covered_len as u64)
-            .checked_mul(size_of::<u32>() as u64)
-            .ok_or(DiscoveryError::Invariant(
-                "discovery coverage bytes overflow",
-            ))?,
-    ) || !seed_fits(
-        &mut modeled,
-        (MAX_CANDIDATES as u64)
-            .checked_mul(size_of::<CandidateRange>() as u64)
-            .ok_or(DiscoveryError::Invariant(
-                "discovery candidate bytes overflow",
-            ))?,
-    ) {
-        return Err(DiscoveryError::AdmissionDenied(
-            AdmissionDeniedReason::DiscoveryBuffer {
-                bytes: modeled,
-                max: MAX_DISCOVERY_BYTES,
-            },
-        ));
-    }
+    let covered_len = source.len() + context.len() + 1;
 
     let mut seeds = Vec::new();
     seeds
         .try_reserve_exact(source_windows)
-        .map_err(|_| DiscoveryError::AdmissionDenied(AdmissionDeniedReason::Allocation))?;
+        .map_err(|_| PlanErrorKind::AdmissionDenied(AdmissionDeniedReason::Allocation))?;
     let mut covered = Vec::new();
     covered
         .try_reserve_exact(covered_len)
-        .map_err(|_| DiscoveryError::AdmissionDenied(AdmissionDeniedReason::Allocation))?;
+        .map_err(|_| PlanErrorKind::AdmissionDenied(AdmissionDeniedReason::Allocation))?;
     let mut ranges = Vec::new();
-    ranges
-        .try_reserve_exact(MAX_CANDIDATES)
-        .map_err(|_| DiscoveryError::AdmissionDenied(AdmissionDeniedReason::Allocation))?;
 
     let mut power = 1u64;
     for _ in 0..minimum {
-        poll(clock)?;
         power = power.wrapping_mul(HASH_BASE);
     }
-    let mut hash = window_hash(source, 0, minimum, clock)?;
-    let mut i = 0usize;
-    while i < source_windows {
-        poll(clock)?;
+    let mut hash = window_hash(source, 0, minimum, stopper)?;
+    for i in 0..source_windows {
+        stopper.tick()?;
         if i > 0 {
             hash = update_hash(hash, source[i - 1], source[i + minimum - 1], power);
         }
@@ -281,20 +195,18 @@ pub(crate) fn discover(
             hash,
             source: i as u32,
         });
-        i += 1;
     }
-    sort_seeds(&mut seeds, clock)?;
+    sort_seeds(&mut seeds, stopper)?;
 
     for _ in 0..covered_len {
-        poll(clock)?;
+        stopper.tick()?;
         covered.push(0u32);
     }
 
-    let mut target_hash = window_hash(context, 0, minimum, clock)?;
-    let mut destination = 0usize;
+    let mut target_hash = window_hash(context, 0, minimum, stopper)?;
     let target_windows = context.len() - minimum + 1;
-    while destination < target_windows {
-        poll(clock)?;
+    for destination in 0..target_windows {
+        stopper.tick()?;
         if destination > 0 {
             target_hash = update_hash(
                 target_hash,
@@ -303,37 +215,22 @@ pub(crate) fn discover(
                 power,
             );
         }
-        let mut lo = 0usize;
-        let mut hi = seeds.len();
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if seeds[mid].hash < target_hash {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        let mut pair = lo;
+        let mut pair = seeds.partition_point(|seed| seed.hash < target_hash);
         while pair < seeds.len() && seeds[pair].hash == target_hash {
-            poll(clock)?;
+            stopper.tick()?;
             let source_start = seeds[pair].source as usize;
             let diagonal = source_start + context.len() - destination;
-            let covered_end = covered[diagonal];
-            if covered_end < (destination + minimum) as u32
-                && exact_prefix(source, source_start, context, destination, minimum, clock)?
+            if covered[diagonal] < (destination + minimum) as u32
+                && exact_prefix(source, source_start, context, destination, minimum, stopper)?
             {
                 let (start, begin, count) =
-                    extend_match(source, source_start, context, destination, minimum, clock)?;
+                    extend_match(source, source_start, context, destination, minimum, stopper)?;
                 covered[diagonal] = (begin + count) as u32;
                 if ranges.len() == MAX_CANDIDATES {
-                    return match clock.check() {
-                        CheckOutcome::Cancelled => Err(DiscoveryError::Cancelled),
-                        CheckOutcome::DeadlineReached => Err(DiscoveryError::BudgetExhausted),
-                        CheckOutcome::Continue => Ok(DiscoveryOutcome {
-                            ranges,
-                            status: DiscoveryStatus::CandidateLimitReached,
-                        }),
-                    };
+                    return Ok(DiscoveryOutcome {
+                        ranges,
+                        status: DiscoveryStatus::CandidateLimitReached,
+                    });
                 }
                 ranges.push(CandidateRange {
                     source_start: start as u32,
@@ -343,7 +240,6 @@ pub(crate) fn discover(
             }
             pair += 1;
         }
-        destination += 1;
     }
     Ok(DiscoveryOutcome {
         ranges,
@@ -355,29 +251,18 @@ pub(crate) fn discover(
 mod tests {
     use super::*;
     use crate::cache_view::{CacheIdentity, CacheView};
-    use crate::timing::DeadlineClock;
     use std::collections::BTreeSet;
     use std::time::{Duration, Instant};
 
-    fn clock(base: Instant) -> impl FnMut() -> Instant {
-        move || base
-    }
-
     fn discover_ranges(source: &[u32], target: &[u32], minimum: u32) -> Vec<CandidateRange> {
-        let base = Instant::now();
         let mut cancel = || false;
-        let mut clock = DeadlineClock::with_clock(
-            base,
-            base + Duration::from_secs(5),
-            clock(base),
-            &mut cancel,
-        );
+        let mut stopper = Stopper::new(Instant::now() + Duration::from_secs(5), &mut cancel);
         let cache = CacheView {
             tokens: source,
             identity: CacheIdentity::new(1),
             minimum_match_tokens: minimum,
         };
-        discover(target, cache, &mut clock)
+        discover(target, cache, &mut stopper)
             .expect("discovery")
             .ranges
     }
@@ -411,21 +296,6 @@ mod tests {
     }
 
     #[test]
-    fn modeled_admission_reports_the_attempted_overlimit_total() {
-        let mut at_limit = MAX_DISCOVERY_BYTES - 1;
-        assert!(seed_fits(&mut at_limit, 1));
-        assert_eq!(at_limit, MAX_DISCOVERY_BYTES);
-
-        let mut over = MAX_DISCOVERY_BYTES;
-        assert!(!seed_fits(&mut over, 1));
-        assert_eq!(over, MAX_DISCOVERY_BYTES + 1);
-
-        let mut overflow = u64::MAX;
-        assert!(!seed_fits(&mut overflow, 1));
-        assert_eq!(overflow, u64::MAX);
-    }
-
-    #[test]
     fn maximal_matches_are_exact_and_complete_on_small_inputs() {
         let mut state = 0x9e37_79b9u64;
         let mut next = || {
@@ -440,6 +310,9 @@ mod tests {
             let source: Vec<u32> = (0..source_len).map(|_| next()).collect();
             let target: Vec<u32> = (0..target_len).map(|_| next()).collect();
             let minimum = 1 + (case % 3) as u32;
+            if minimum as usize > source_len || minimum as usize > target_len {
+                continue;
+            }
             let actual: BTreeSet<_> = discover_ranges(&source, &target, minimum)
                 .into_iter()
                 .map(|r| (r.source_start, r.destination_start, r.token_count))
@@ -450,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn seed_sort_polls_cancellation() {
+    fn seed_sort_stops_on_cancellation() {
         let base = Instant::now();
         let mut seeds: Vec<Seed> = (0..5_000u32)
             .rev()
@@ -460,16 +333,12 @@ mod tests {
             })
             .collect();
         let mut cancel = || true;
-        let mut clock = DeadlineClock::with_clock(
-            base,
-            base + Duration::from_secs(5),
-            clock(base),
-            &mut cancel,
+        let mut stopper =
+            Stopper::with_clock(base + Duration::from_secs(5), &mut cancel, move |_| base);
+        assert_eq!(
+            sort_seeds(&mut seeds, &mut stopper),
+            Err(PlanErrorKind::Cancelled)
         );
-        assert!(matches!(
-            sort_seeds(&mut seeds, &mut clock),
-            Err(DiscoveryError::Cancelled)
-        ));
     }
 
     #[test]

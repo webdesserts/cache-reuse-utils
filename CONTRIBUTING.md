@@ -2,21 +2,13 @@
 
 ## Build and test
 
-The default production crate is `std`-only. The opt-in `test-support` feature
-adds the pinned `mock_instant` clock bridge for public integration tests; it is
-never enabled by default.
+The core crate is `std`-only with no dependencies.
 
 ```sh
-cargo fmt --check
-cargo check --offline
-cargo test --offline                  # default production build; excludes clock bridge tests
-cargo test --offline --features test-support
-cargo clippy --offline --all-targets -- -D warnings
-cargo clippy --offline --all-targets --features test-support -- -D warnings
+cargo fmt --all --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
 ```
-
-The default suite omits `tests/test_support_clock.rs`; run the feature-enabled
-suite to exercise the per-thread mock-clock bridge and public phase tests.
 
 Prefer API-level integration tests under `tests/` that exercise the public
 contract. Unit tests inside a module are appropriate for complex algorithm
@@ -25,18 +17,16 @@ internals that would be awkward to drive through the public API.
 ## C ABI checks
 
 The FFI is an explicit workspace member, while the core remains the default
-member:
+member. `cargo test --workspace` runs its Rust tests. The C tests
+build the release archive and link C programs against the checked-in header:
 
 ```sh
-cargo test --locked -p cache-reuse-utils-ffi
-cargo build --release --locked -p cache-reuse-utils-ffi \
-  --target-dir /absolute/owned/target
 ./ffi/tests/run-c-tests.sh /absolute/owned/target
 ```
 
-The C runner defaults to `<repo>/target`, and uses the target directory argument
-for both Cargo and the archive link, so a custom target cannot silently test a
-stale default archive. The workspace release profile is unwind, but a downstream
+The C runner defaults to `<repo>/target`, uses the target directory argument
+for both Cargo and the archive link, and writes its binaries to
+`<target>/c-tests`. The workspace release profile is unwind, but a downstream
 Cargo consumer's root profile still controls its Git dependency build; set
 `[profile.release] panic = "unwind"` there when relying on the FFI's panic
 containment. Header freshness is optional and requires cbindgen 0.29.4:

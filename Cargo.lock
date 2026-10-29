@@ -5,9 +5,6 @@ version = 4
 [[package]]
 name = "cache-reuse-utils"
 version = "0.1.0"
-dependencies = [
- "mock_instant",
-]
 
 [[package]]
 name = "cache-reuse-utils-ffi"
@@ -15,9 +12,3 @@ version = "0.1.0"
 dependencies = [
  "cache-reuse-utils",
 ]
-
-[[package]]
-name = "mock_instant"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bb517913cfcfb9eeda59f36020269075a152701a01606c612f547e4890be399"

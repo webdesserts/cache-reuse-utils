@@ -20,13 +20,3 @@ pub struct CandidateRange {
     /// Number of tokens in the range; must be greater than zero.
     pub token_count: u32,
 }
-
-impl CandidateRange {
-    pub fn source_end(&self) -> Option<u32> {
-        self.source_start.checked_add(self.token_count)
-    }
-
-    pub fn destination_end(&self) -> Option<u32> {
-        self.destination_start.checked_add(self.token_count)
-    }
-}

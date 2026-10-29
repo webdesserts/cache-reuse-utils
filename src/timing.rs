@@ -1,28 +1,30 @@
-//! Absolute deadline, cancellation and returned timing metadata.
+//! Deadline and cancellation checks, stage tracking and returned timing.
 //!
-//! The public entry point registers one monotonic [`Instant`] deadline with a
-//! shared background timer owner. Discovery/search read that analysis's
-//! notification flag at natural loop points; this module's clock reads remain at
-//! phase boundaries for telemetry. Tests can inject deterministic time and a
-//! manual expiry signal.
+//! [`Stopper`] is the single place analysis asks "should I stop?". Stage
+//! boundaries call [`Stopper::check`]; inner loops call [`Stopper::tick`], which
+//! performs a real check once every [`TICKS_PER_CHECK`] calls. Each real check
+//! calls the caller's cancellation callback first and then compares
+//! `Instant::now()` with the absolute deadline, so cancellation always wins.
 
 use std::time::{Duration, Instant};
 
-use crate::deadline::{self, DeadlineRegistration, DeadlineSignal, TimerError};
+/// Inner-loop iterations between real deadline/cancellation checks. Every
+/// ticked loop body is O(1), so a stop is observed within microseconds.
+const TICKS_PER_CHECK: u32 = 4096;
 
 /// The stage at which an analysis stopped or failed.
 ///
-/// A stage can identify the phase that refused entry before it started (for
-/// example, `Search` when discovery completed at the deadline). The matching
-/// optional timing is then `None`, distinguishing “not entered” from a zero
-/// duration.
+/// A stage can name the phase that refused entry before it started (for
+/// example, `Search` when the deadline was observed after discovery). The
+/// matching optional duration in [`AnalysisTiming`] is then `None`,
+/// distinguishing "not entered" from a zero duration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnalysisStage {
     /// Input validation and resource admission, before discovery starts.
     Preparation,
     /// Exact candidate discovery, including index construction and matching.
     Discovery,
-    /// Candidate search or its bounded finishing work.
+    /// Placement search over the discovered candidates.
     Search,
     /// Building the returned plan after search.
     Finish,
@@ -30,44 +32,24 @@ pub enum AnalysisStage {
 
 /// Small timing summary for a completed plan or an informative failure.
 ///
-/// `elapsed` runs from the analysis-start checkpoint to the finish/error
-/// checkpoint. `limit` is `deadline - start` (zero when the deadline was already
-/// past). `preparation` covers start to discovery-start (or finish when
-/// discovery never started), `discovery` is present when discovery ran, and
-/// `search` is present only when search started. Stage boundaries share the
-/// finish checkpoint convention, so at a successful finish
-/// `preparation + discovery + search == elapsed`; absent stages are `None`.
-/// `reached` means the finish checkpoint was at or after the absolute deadline.
-/// These are cooperative wall-clock observations, not a hard-realtime guarantee.
+/// `elapsed` runs from the analysis start to the finish or error checkpoint.
+/// `limit` is `deadline - start` (zero when the deadline had already passed).
+/// `preparation` covers start to discovery start (or to finish when discovery
+/// never started). `discovery` and `search` are `None` when that stage was not
+/// entered. Stage boundaries share checkpoints, so
+/// `preparation + discovery + search == elapsed` for the entered stages.
+/// `reached` means the finish checkpoint was at or after the deadline. These
+/// are cooperative wall-clock observations, not a hard-realtime guarantee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AnalysisTiming {
     elapsed: Duration,
     limit: Duration,
-    reached: bool,
     preparation: Duration,
     discovery: Option<Duration>,
     search: Option<Duration>,
 }
 
 impl AnalysisTiming {
-    pub(crate) const fn new(
-        elapsed: Duration,
-        limit: Duration,
-        reached: bool,
-        preparation: Duration,
-        discovery: Option<Duration>,
-        search: Option<Duration>,
-    ) -> Self {
-        Self {
-            elapsed,
-            limit,
-            reached,
-            preparation,
-            discovery,
-            search,
-        }
-    }
-
     pub fn elapsed(&self) -> Duration {
         self.elapsed
     }
@@ -78,7 +60,7 @@ impl AnalysisTiming {
 
     /// True when the finish checkpoint was at or after the absolute deadline.
     pub fn reached(&self) -> bool {
-        self.reached
+        self.elapsed >= self.limit
     }
 
     pub fn preparation(&self) -> Duration {
@@ -96,217 +78,140 @@ impl AnalysisTiming {
     }
 }
 
-/// The single production clock read. Feature-enabled but unarmed threads and
-/// default builds use the real standard clock.
-fn now_std() -> Instant {
-    #[cfg(feature = "test-support")]
-    if let Some(now) = crate::test_support::mapped_now() {
-        return now;
-    }
-    Instant::now()
-}
-
-/// Concrete stage-boundary state owned by timing. The orchestrator records the
-/// stages it actually entered; finish() turns those points into public timing.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct TimingState {
-    discovery_start: Instant,
-    discovery_end: Option<Instant>,
-    search_start: Option<Instant>,
-}
-
-impl TimingState {
-    pub(crate) fn new(discovery_start: Instant) -> Self {
-        Self {
-            discovery_start,
-            discovery_end: None,
-            search_start: None,
-        }
-    }
-
-    pub(crate) fn discovery_finished(&mut self, end: Instant) {
-        self.discovery_end = Some(end);
-    }
-
-    pub(crate) fn search_started(&mut self, start: Instant) {
-        self.search_start = Some(start);
-    }
-
-    pub(crate) fn finish(&self, clock: &DeadlineClock<'_>, finish: Instant) -> AnalysisTiming {
-        AnalysisTiming::from_stages(
-            clock,
-            finish,
-            self.discovery_start,
-            self.discovery_end,
-            self.search_start,
-        )
-    }
-}
-
-impl AnalysisTiming {
-    /// Timing for a failure or no-work result before discovery starts.
-    pub(crate) fn preparation_only(clock: &DeadlineClock<'_>, finish: Instant) -> Self {
-        Self::from_stages(clock, finish, finish, None, None)
-    }
-
-    fn from_stages(
-        clock: &DeadlineClock<'_>,
-        finish: Instant,
-        discovery_start: Instant,
-        discovery_end: Option<Instant>,
-        search_start: Option<Instant>,
-    ) -> Self {
-        let started = clock.started();
-        let elapsed = finish.saturating_duration_since(started);
-        let preparation = discovery_start.saturating_duration_since(started);
-        let discovery = discovery_end.map(|end| end.saturating_duration_since(discovery_start));
-        let search = search_start.map(|start| finish.saturating_duration_since(start));
-        Self::new(
-            elapsed,
-            clock.limit(),
-            finish >= clock.deadline(),
-            preparation,
-            discovery,
-            search,
-        )
-    }
-}
-
+/// Why a check asked analysis to stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CheckOutcome {
-    Continue,
-    DeadlineReached,
+pub(crate) enum Stop {
     Cancelled,
+    Deadline,
 }
 
-/// Private deadline clock. The background timer flag is the control authority;
-/// `now` is used only for phase-boundary telemetry. Tests can inject a clock and
-/// a signal without exposing a public clock framework.
-pub(crate) struct DeadlineClock<'a> {
+/// Cooperative deadline/cancellation checks plus the stage boundaries used to
+/// label errors and build [`AnalysisTiming`].
+pub(crate) struct Stopper<'a> {
     started: Instant,
     deadline: Instant,
-    now: Box<dyn FnMut() -> Instant + 'a>,
     cancel: &'a mut dyn FnMut() -> bool,
-    signal: DeadlineSignal,
-    _registration: Option<DeadlineRegistration>,
-    #[cfg(feature = "test-support")]
-    manual_binding: Option<crate::test_support::ManualDeadlineBinding>,
+    ticks: u32,
+    ticks_per_check: u32,
+    stage: AnalysisStage,
+    discovery_start: Option<Instant>,
+    discovery_end: Option<Instant>,
+    search_start: Option<Instant>,
+    #[cfg(test)]
+    clock: Option<Box<dyn FnMut(AnalysisStage) -> Instant + 'a>>,
 }
 
-impl<'a> DeadlineClock<'a> {
-    pub(crate) fn start(deadline: Instant, cancel: &'a mut dyn FnMut() -> bool) -> Self {
+impl<'a> Stopper<'a> {
+    pub(crate) fn new(deadline: Instant, cancel: &'a mut dyn FnMut() -> bool) -> Self {
         Self {
-            started: now_std(),
+            started: Instant::now(),
             deadline,
-            now: Box::new(now_std),
             cancel,
-            signal: DeadlineSignal::new(),
-            _registration: None,
-            #[cfg(feature = "test-support")]
-            manual_binding: None,
+            ticks: 0,
+            ticks_per_check: TICKS_PER_CHECK,
+            stage: AnalysisStage::Preparation,
+            discovery_start: None,
+            discovery_end: None,
+            search_start: None,
+            #[cfg(test)]
+            clock: None,
         }
     }
 
+    /// Test seam: time comes from `clock`, which sees the current stage, and
+    /// every tick performs a real check. Time starts at `clock(Preparation)`.
     #[cfg(test)]
     pub(crate) fn with_clock(
-        started: Instant,
         deadline: Instant,
-        now: impl FnMut() -> Instant + 'a,
         cancel: &'a mut dyn FnMut() -> bool,
+        mut clock: impl FnMut(AnalysisStage) -> Instant + 'a,
     ) -> Self {
+        let started = clock(AnalysisStage::Preparation);
         Self {
             started,
-            deadline,
-            now: Box::new(now),
-            cancel,
-            signal: DeadlineSignal::new(),
-            _registration: None,
-            #[cfg(feature = "test-support")]
-            manual_binding: None,
+            ticks_per_check: 1,
+            clock: Some(Box::new(clock)),
+            ..Self::new(deadline, cancel)
         }
-    }
-
-    /// Start the background owner after validation/no-work handling. A due
-    /// deadline initializes the signal directly; future deadlines register with
-    /// the shared service.
-    pub(crate) fn arm_timer(&mut self) -> Result<(), TimerError> {
-        #[cfg(feature = "test-support")]
-        if let Some(binding) = crate::test_support::ManualDeadlineBinding::install() {
-            self.signal = binding.signal();
-            self.manual_binding = Some(binding);
-            // Match production registration: compare the current bridged time,
-            // not the analysis start checkpoint.
-            if self.now() >= self.deadline {
-                self.signal.expire();
-            }
-            return Ok(());
-        }
-        self._registration = Some(deadline::register(self.deadline, self.signal.clone())?);
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn expire_for_test(&self) {
-        self.signal.expire();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn signal_for_test(&self) -> DeadlineSignal {
-        self.signal.clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_clock_signal(
-        started: Instant,
-        deadline: Instant,
-        now: impl FnMut() -> Instant + 'a,
-        signal: DeadlineSignal,
-        cancel: &'a mut dyn FnMut() -> bool,
-    ) -> Self {
-        Self {
-            started,
-            deadline,
-            now: Box::new(now),
-            cancel,
-            signal,
-            _registration: None,
-            #[cfg(feature = "test-support")]
-            manual_binding: None,
-        }
-    }
-
-    pub(crate) fn started(&self) -> Instant {
-        self.started
-    }
-
-    pub(crate) fn deadline(&self) -> Instant {
-        self.deadline
-    }
-
-    /// Total budget from the analysis-start checkpoint, saturating at zero when
-    /// the deadline was already past.
-    pub(crate) fn limit(&self) -> Duration {
-        self.deadline.saturating_duration_since(self.started)
     }
 
     pub(crate) fn now(&mut self) -> Instant {
-        (self.now)()
+        #[cfg(test)]
+        if let Some(clock) = &mut self.clock {
+            return clock(self.stage);
+        }
+        Instant::now()
+    }
+
+    pub(crate) fn stage(&self) -> AnalysisStage {
+        self.stage
     }
 
     pub(crate) fn cancelled(&mut self) -> bool {
         (self.cancel)()
     }
 
-    /// Cancellation is checked before the deadline, so a boundary cancellation
-    /// never looks like a budget result.
-    pub(crate) fn check(&mut self) -> CheckOutcome {
-        if (self.cancel)() {
-            return CheckOutcome::Cancelled;
+    /// Check cancellation, then the deadline.
+    pub(crate) fn check(&mut self) -> Result<(), Stop> {
+        if self.cancelled() {
+            return Err(Stop::Cancelled);
         }
-        if self.signal.expired() {
-            return CheckOutcome::DeadlineReached;
+        if self.now() >= self.deadline {
+            return Err(Stop::Deadline);
         }
-        CheckOutcome::Continue
+        Ok(())
+    }
+
+    /// Inner-loop check: a real [`Self::check`] once per `TICKS_PER_CHECK`.
+    #[inline]
+    pub(crate) fn tick(&mut self) -> Result<(), Stop> {
+        self.ticks += 1;
+        if self.ticks < self.ticks_per_check {
+            return Ok(());
+        }
+        self.ticks = 0;
+        self.check()
+    }
+
+    pub(crate) fn enter_discovery(&mut self) {
+        self.stage = AnalysisStage::Discovery;
+        self.discovery_start = Some(self.now());
+    }
+
+    /// Close discovery and label later stops as `Search`. Search timing starts
+    /// only at [`Self::start_search`], so a refusal at this boundary reports no
+    /// search duration.
+    pub(crate) fn finish_discovery(&mut self) {
+        self.discovery_end = Some(self.now());
+        self.stage = AnalysisStage::Search;
+    }
+
+    pub(crate) fn start_search(&mut self) {
+        self.search_start = self.discovery_end;
+    }
+
+    pub(crate) fn enter_finish(&mut self) {
+        self.stage = AnalysisStage::Finish;
+    }
+
+    /// Timing up to now, using the recorded stage boundaries.
+    pub(crate) fn timing(&mut self) -> AnalysisTiming {
+        let finish = self.now();
+        let started = self.started;
+        let discovery_start = self.discovery_start.unwrap_or(finish);
+        AnalysisTiming {
+            elapsed: finish.saturating_duration_since(started),
+            limit: self.deadline.saturating_duration_since(started),
+            preparation: discovery_start.saturating_duration_since(started),
+            discovery: self.discovery_start.map(|start| {
+                self.discovery_end
+                    .unwrap_or(finish)
+                    .saturating_duration_since(start)
+            }),
+            search: self
+                .search_start
+                .map(|start| finish.saturating_duration_since(start)),
+        }
     }
 }
 
@@ -314,72 +219,41 @@ impl<'a> DeadlineClock<'a> {
 mod tests {
     use super::*;
 
-    fn clock_at(base: Instant, offset_ms: u64) -> impl FnMut() -> Instant {
-        move || base + Duration::from_millis(offset_ms)
-    }
-
     #[test]
-    fn zero_remaining_time_is_reached_by_the_signal_but_cancel_still_wins() {
+    fn cancellation_is_checked_before_an_expired_deadline() {
         let base = Instant::now();
-        let mut cancel = || false;
-        let mut clock = DeadlineClock::with_clock(base, base, clock_at(base, 0), &mut cancel);
-        clock.expire_for_test();
-        assert_eq!(clock.check(), CheckOutcome::DeadlineReached);
-
         let mut cancelled = || true;
-        let mut clock = DeadlineClock::with_clock(base, base, clock_at(base, 0), &mut cancelled);
-        clock.expire_for_test();
-        assert_eq!(clock.check(), CheckOutcome::Cancelled);
+        let mut stopper = Stopper::with_clock(base, &mut cancelled, move |_| base);
+        assert_eq!(stopper.check(), Err(Stop::Cancelled));
+
+        let mut running = || false;
+        let mut stopper = Stopper::with_clock(base, &mut running, move |_| base);
+        assert_eq!(stopper.check(), Err(Stop::Deadline));
     }
 
     #[test]
-    fn signal_expiry_is_the_control_and_cancellation_precedes_it() {
+    fn tick_checks_once_per_interval() {
+        let mut calls = 0u32;
+        let mut cancel = || {
+            calls += 1;
+            false
+        };
+        let mut stopper = Stopper::new(Instant::now() + Duration::from_secs(60), &mut cancel);
+        for _ in 0..TICKS_PER_CHECK * 3 {
+            stopper.tick().expect("running");
+        }
+        drop(stopper);
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn a_past_deadline_has_zero_limit() {
         let base = Instant::now();
-        let deadline = base + Duration::from_secs(5);
         let mut cancel = || false;
-        let mut clock = DeadlineClock::with_clock(base, deadline, clock_at(base, 0), &mut cancel);
-        assert_eq!(clock.check(), CheckOutcome::Continue);
-        clock.expire_for_test();
-        assert_eq!(clock.check(), CheckOutcome::DeadlineReached);
-
-        let mut cancelled = || true;
-        let mut clock =
-            DeadlineClock::with_clock(base, deadline, clock_at(base, 0), &mut cancelled);
-        clock.expire_for_test();
-        assert_eq!(clock.check(), CheckOutcome::Cancelled);
-    }
-
-    #[test]
-    fn a_deadline_before_the_start_has_zero_limit_and_signal_expiry() {
-        let base = Instant::now();
-        let deadline = base;
-        let started = base + Duration::from_millis(3);
-        let mut cancel = || false;
-        let mut clock =
-            DeadlineClock::with_clock(started, deadline, clock_at(started, 0), &mut cancel);
-        assert_eq!(clock.limit(), Duration::ZERO);
-        clock.expire_for_test();
-        assert_eq!(clock.check(), CheckOutcome::DeadlineReached);
-    }
-
-    #[test]
-    fn cancellation_at_an_expired_signal_is_not_a_budget_stop() {
-        let base = Instant::now();
-        let deadline = base + Duration::from_millis(5);
-        let mut cancel = || true;
-        let mut clock = DeadlineClock::with_clock(base, deadline, clock_at(base, 5), &mut cancel);
-        clock.expire_for_test();
-        assert_eq!(clock.check(), CheckOutcome::Cancelled);
-    }
-    #[test]
-    fn real_timer_delivery_reaches_the_clock_control() {
-        let deadline = Instant::now() + Duration::from_millis(250);
-        let mut cancel = || false;
-        let mut clock = DeadlineClock::start(deadline, &mut cancel);
-        clock.arm_timer().expect("timer");
-        let signal = clock.signal_for_test();
-        assert!(!signal.expired(), "future deadline must not be pre-expired");
-        signal.wait_for_expiry(Duration::from_secs(5));
-        assert_eq!(clock.check(), CheckOutcome::DeadlineReached);
+        let mut stopper =
+            Stopper::with_clock(base, &mut cancel, move |_| base + Duration::from_millis(3));
+        let timing = stopper.timing();
+        assert_eq!(timing.limit(), Duration::ZERO);
+        assert!(timing.reached());
     }
 }

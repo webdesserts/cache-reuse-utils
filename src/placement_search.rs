@@ -17,10 +17,11 @@ use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
 
 use crate::candidate::CandidateRange;
+use crate::error::{AdmissionDeniedReason, PlanErrorKind};
 use crate::placement::{
     Insertion, MAX_PLACEMENT_BYTES, PlacedRange, PlacementPolicy, PlacementStatus,
 };
-use crate::timing::{CheckOutcome, DeadlineClock};
+use crate::timing::{Stop, Stopper};
 
 /// Retained headroom for publishing a fully computed completed plan before
 /// optional extension-state storage consumes the rest of the model.
@@ -48,6 +49,29 @@ pub(crate) enum SearchError {
     AdmissionDenied,
     LimitReached(PlacementStatus),
     Invariant(&'static str),
+}
+
+impl From<Stop> for SearchError {
+    fn from(stop: Stop) -> Self {
+        match stop {
+            Stop::Cancelled => Self::Cancelled,
+            Stop::Deadline => Self::BudgetExhausted,
+        }
+    }
+}
+
+impl From<SearchError> for PlanErrorKind {
+    fn from(error: SearchError) -> Self {
+        match error {
+            SearchError::Cancelled => Self::Cancelled,
+            SearchError::BudgetExhausted => Self::BudgetExhausted,
+            SearchError::AdmissionDenied => {
+                Self::AdmissionDenied(AdmissionDeniedReason::Allocation)
+            }
+            SearchError::LimitReached(status) => Self::PlacementIncomplete(status),
+            SearchError::Invariant(reason) => Self::Invariant(reason),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -147,17 +171,13 @@ fn copy_partial(partial: &Partial) -> Result<Partial, SearchError> {
 fn derive_variants(
     matches: &[CandidateRange],
     policy: &PlacementPolicy<'_>,
-    clock: &mut DeadlineClock<'_>,
+    stopper: &mut Stopper<'_>,
 ) -> Result<(Vec<Variant>, bool), SearchError> {
     let mut variants = Vec::new();
     let mut seen = HashSet::new();
     let mut truncated = false;
     'outer: for range in matches {
-        match clock.check() {
-            CheckOutcome::Continue => {}
-            CheckOutcome::DeadlineReached => return Err(SearchError::BudgetExhausted),
-            CheckOutcome::Cancelled => return Err(SearchError::Cancelled),
-        }
+        stopper.tick()?;
         if range.token_count == 0 {
             continue;
         }
@@ -165,13 +185,7 @@ fn derive_variants(
         let max_right = policy.max_trim_right.min(range.token_count - 1);
         for left in 0..=max_left {
             for right in 0..=max_right {
-                match clock.check() {
-                    CheckOutcome::Continue => {}
-                    CheckOutcome::DeadlineReached => {
-                        return Err(SearchError::BudgetExhausted);
-                    }
-                    CheckOutcome::Cancelled => return Err(SearchError::Cancelled),
-                }
+                stopper.tick()?;
                 let Some(count) = range.token_count.checked_sub(left + right) else {
                     continue;
                 };
@@ -298,6 +312,19 @@ pub(crate) struct PlacementOutcome {
     pub padding: u32,
     pub best_useful: u64,
     pub status: PlacementStatus,
+}
+
+impl PlacementOutcome {
+    pub(crate) fn empty(best_useful: u64, status: PlacementStatus) -> Self {
+        Self {
+            plan: Vec::new(),
+            insertions: Vec::new(),
+            covered: 0,
+            padding: 0,
+            best_useful,
+            status,
+        }
+    }
 }
 
 struct Search<'a> {
@@ -696,17 +723,15 @@ impl<'a> Search<'a> {
         }
     }
 
-    fn run(mut self, clock: &mut DeadlineClock<'_>) -> Result<PlacementOutcome, SearchError> {
-        let mut completed = true;
+    fn run(mut self, stopper: &mut Stopper<'_>) -> Result<PlacementOutcome, SearchError> {
         'outer: for j in 0..self.variants.len() {
-            match clock.check() {
-                CheckOutcome::Continue => {}
-                CheckOutcome::DeadlineReached => {
+            match stopper.tick() {
+                Ok(()) => {}
+                Err(Stop::Deadline) => {
                     self.stopped_for_deadline = true;
-                    completed = false;
                     break 'outer;
                 }
-                CheckOutcome::Cancelled => return Err(SearchError::Cancelled),
+                Err(Stop::Cancelled) => return Err(SearchError::Cancelled),
             }
             let variant = self.variants[j];
             let start = self.transition(None, &variant, j)?;
@@ -724,14 +749,13 @@ impl<'a> Search<'a> {
             for index in 0..snapshot {
                 // Every natural state iteration is a cancellation/deadline
                 // point. There is no modulo or work-counter scheduling.
-                match clock.check() {
-                    CheckOutcome::Continue => {}
-                    CheckOutcome::DeadlineReached => {
+                match stopper.tick() {
+                    Ok(()) => {}
+                    Err(Stop::Deadline) => {
                         self.stopped_for_deadline = true;
-                        completed = false;
                         break 'outer;
                     }
-                    CheckOutcome::Cancelled => return Err(SearchError::Cancelled),
+                    Err(Stop::Cancelled) => return Err(SearchError::Cancelled),
                 }
                 let key = self.order[index];
                 let Some(partial) = self.states.get(&key).cloned() else {
@@ -752,18 +776,12 @@ impl<'a> Search<'a> {
                 }
             }
         }
-        self.finish(clock, completed)
+        self.finish(stopper)
     }
 
-    fn finish(
-        mut self,
-        clock: &mut DeadlineClock<'_>,
-        completed: bool,
-    ) -> Result<PlacementOutcome, SearchError> {
-        match clock.check() {
-            CheckOutcome::Cancelled => return Err(SearchError::Cancelled),
-            CheckOutcome::DeadlineReached if !completed => self.stopped_for_deadline = true,
-            CheckOutcome::DeadlineReached | CheckOutcome::Continue => {}
+    fn finish(self, stopper: &mut Stopper<'_>) -> Result<PlacementOutcome, SearchError> {
+        if stopper.check() == Err(Stop::Cancelled) {
+            return Err(SearchError::Cancelled);
         }
         let best_useful = self.best_useful;
         if best_useful == 0 {
@@ -773,18 +791,14 @@ impl<'a> Search<'a> {
             if let Some(status) = self.limit_status {
                 return Err(SearchError::LimitReached(status));
             }
-            return Ok(PlacementOutcome {
-                plan: Vec::new(),
-                insertions: Vec::new(),
-                covered: 0,
-                padding: 0,
-                best_useful: 0,
-                status: PlacementStatus::NoFeasibleReuse,
-            });
+            return Ok(PlacementOutcome::empty(0, PlacementStatus::NoFeasibleReuse));
         }
-        let allowance = self.policy.loss_allowance.basis_points() as u64;
-        let loss = best_useful.saturating_mul(allowance) / 10_000;
-        let admissible_min = best_useful - loss;
+        let admissible_min = self.policy.loss_allowance.floor(best_useful);
+        let status = if self.stopped_for_deadline {
+            PlacementStatus::DeadlinePartial
+        } else {
+            self.limit_status.unwrap_or(PlacementStatus::Complete)
+        };
 
         let mut selected: Option<&Partial> = None;
         for bucket in &self.buckets {
@@ -809,31 +823,11 @@ impl<'a> Search<'a> {
         // At 100% allowance, a zero-covered empty plan competes after B is
         // known. It is not seeded before a valid plan exists.
         if admissible_min == 0 && selected.is_none_or(|p| p.padding > 0) {
-            return Ok(PlacementOutcome {
-                plan: Vec::new(),
-                insertions: Vec::new(),
-                covered: 0,
-                padding: 0,
-                best_useful,
-                status: if self.stopped_for_deadline {
-                    PlacementStatus::DeadlinePartial
-                } else if let Some(status) = self.limit_status {
-                    status
-                } else {
-                    PlacementStatus::Complete
-                },
-            });
+            return Ok(PlacementOutcome::empty(best_useful, status));
         }
         let selected = selected.ok_or(SearchError::Invariant(
             "best completed plan has no admissible bucket",
         ))?;
-        let status = if self.stopped_for_deadline {
-            PlacementStatus::DeadlinePartial
-        } else if let Some(status) = self.limit_status {
-            status
-        } else {
-            PlacementStatus::Complete
-        };
         Ok(PlacementOutcome {
             plan: selected.plan.clone(),
             insertions: selected.insertions.clone(),
@@ -845,24 +839,20 @@ impl<'a> Search<'a> {
     }
 }
 
-/// Run the placement-aware search. `matches` are maximal logical matches from
-/// discovery; they are not fed through the raw candidate-pool validator.
+/// Run the placement search over discovered maximal matches.
 pub(crate) fn search(
     context_len: usize,
     matches: &[CandidateRange],
     k: u32,
     policy: &PlacementPolicy<'_>,
-    clock: &mut DeadlineClock<'_>,
+    stopper: &mut Stopper<'_>,
 ) -> Result<PlacementOutcome, SearchError> {
-    if context_len > u32::MAX as usize {
-        return Err(SearchError::Invariant("target exceeds u32 coordinates"));
-    }
-    let (variants, truncated) = derive_variants(matches, policy, clock)?;
+    let (variants, truncated) = derive_variants(matches, policy, stopper)?;
     let mut search = Search::new(context_len, policy, k, variants)?;
     if truncated {
         search.limit_status = Some(PlacementStatus::VariantLimitReached);
     }
-    search.run(clock)
+    search.run(stopper)
 }
 
 #[cfg(test)]

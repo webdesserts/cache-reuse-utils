@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use cache_reuse_utils::{
     AnalysisTiming, CacheIdentity, CacheReuseAnalysis, CacheView, LossAllowance, PlacementPolicy,
-    PlacementStatus, PlanError,
+    PlacementStatus, PlanError, PlanErrorKind,
 };
 
 pub const CACHE_REUSE_COMPLETE: u32 = 0;
@@ -32,7 +32,7 @@ const _: () = assert!(CACHE_REUSE_MAX_RANGES == cache_reuse_utils::MAX_RANGES as
 const _: () = assert!(CACHE_REUSE_MAX_INSERTIONS == 10);
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct CacheReuseRange {
     pub source_start: u32,
     pub destination_start: u32,
@@ -41,7 +41,7 @@ pub struct CacheReuseRange {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct CacheReuseInsertion {
     pub before_target_index: u32,
     pub token: u32,
@@ -74,6 +74,7 @@ pub struct CacheReuseConfig {
 }
 
 #[repr(C)]
+#[derive(Default)]
 pub struct CacheReuseResult {
     pub status: u32,
     pub covered_tokens: u32,
@@ -146,16 +147,16 @@ fn error_status(error: &BridgeError) -> u32 {
 }
 
 fn error_status_plan(error: &PlanError) -> u32 {
-    match error {
-        PlanError::Cancelled { .. } => CACHE_REUSE_ERR_CANCELLED,
-        PlanError::BudgetExhausted { .. } => CACHE_REUSE_ERR_BUDGET,
-        PlanError::AdmissionDenied { .. } | PlanError::PlacementIncomplete { .. } => {
+    match error.kind {
+        PlanErrorKind::Cancelled => CACHE_REUSE_ERR_CANCELLED,
+        PlanErrorKind::BudgetExhausted => CACHE_REUSE_ERR_BUDGET,
+        PlanErrorKind::AdmissionDenied(_) | PlanErrorKind::PlacementIncomplete(_) => {
             CACHE_REUSE_ERR_ADMISSION
         }
-        PlanError::InvalidInput { .. } | PlanError::InvalidPlacementPolicy { .. } => {
+        PlanErrorKind::InvalidInput(_) | PlanErrorKind::InvalidPlacementPolicy(_) => {
             CACHE_REUSE_ERR_INVALID
         }
-        PlanError::Invariant { .. } => CACHE_REUSE_ERR_PANIC,
+        PlanErrorKind::Invariant(_) => CACHE_REUSE_ERR_PANIC,
     }
 }
 
@@ -227,18 +228,6 @@ fn apply_timing(result: &mut CacheReuseResult, timing: AnalysisTiming) {
     result.timing_known = true;
 }
 
-fn plan_error_timing(error: &PlanError) -> Option<AnalysisTiming> {
-    match error {
-        PlanError::InvalidInput { timing, .. }
-        | PlanError::InvalidPlacementPolicy { timing, .. }
-        | PlanError::BudgetExhausted { timing, .. }
-        | PlanError::Cancelled { timing, .. }
-        | PlanError::AdmissionDenied { timing, .. }
-        | PlanError::PlacementIncomplete { timing, .. }
-        | PlanError::Invariant { timing, .. } => Some(*timing),
-    }
-}
-
 fn apply_result(result: &mut CacheReuseResult, plan: cache_reuse_utils::ReusePlan) -> bool {
     let ranges = plan.placement().ranges.as_slice();
     let insertions = plan.placement().insertions.as_slice();
@@ -305,22 +294,7 @@ pub unsafe extern "C" fn cache_reuse_plan(
     let result_ref = unsafe { &mut *result };
     *result_ref = CacheReuseResult {
         status: CACHE_REUSE_ERR_INVALID,
-        covered_tokens: 0,
-        inserted_padding: 0,
-        prepared_tokens: 0,
-        best_useful: 0,
-        admissible_min: 0,
-        range_count: 0,
-        insertion_count: 0,
-        elapsed_ns: 0,
-        preparation_ns: 0,
-        discovery_ns: 0,
-        search_ns: 0,
-        discovery_entered: false,
-        search_entered: false,
-        timing_known: false,
-        ranges: [empty_range2(); CACHE_REUSE_MAX_RANGES],
-        insertions: [empty_insertion2(); CACHE_REUSE_MAX_INSERTIONS],
+        ..Default::default()
     };
     let deadline = match Instant::now().checked_add(Duration::from_millis(config.budget_ms as u64))
     {
@@ -397,14 +371,12 @@ pub unsafe extern "C" fn cache_reuse_plan(
         }
         Ok(Err(plan_error)) => {
             result_ref.status = error_status(&plan_error);
-            if let BridgeError::Plan(value) = &plan_error
-                && let Some(timing) = plan_error_timing(value)
-            {
-                apply_timing(result_ref, timing);
+            if let BridgeError::Plan(value) = &plan_error {
+                apply_timing(result_ref, value.timing);
             }
             let message = match &plan_error {
                 BridgeError::Invalid(value) => value.clone(),
-                BridgeError::Plan(value) => format!("{value:?}"),
+                BridgeError::Plan(value) => value.to_string(),
             };
             set_error(error, error_len, &message);
             1
@@ -414,21 +386,5 @@ pub unsafe extern "C" fn cache_reuse_plan(
             set_error(error, error_len, "planner panicked");
             1
         }
-    }
-}
-
-fn empty_range2() -> CacheReuseRange {
-    CacheReuseRange {
-        source_start: 0,
-        destination_start: 0,
-        count: 0,
-        prepared_start: 0,
-    }
-}
-fn empty_insertion2() -> CacheReuseInsertion {
-    CacheReuseInsertion {
-        before_target_index: 0,
-        token: 0,
-        count: 0,
     }
 }

@@ -2,7 +2,8 @@
 
 use cache_reuse_utils::{
     AdmissionDeniedReason, AnalysisStage, CacheIdentity, CacheReuseAnalysis, CacheView,
-    ContractError, DiscoveryStatus, InputSide, PlacementPolicy, PlanError, ReusePlan,
+    ContractError, DiscoveryStatus, InputSide, PlacedRange, PlacementPolicy, PlanError,
+    PlanErrorKind, ReusePlan,
 };
 use std::time::{Duration, Instant};
 
@@ -29,15 +30,12 @@ fn run(
     .analyze()
 }
 
-fn range(
-    source_start: u32,
-    destination_start: u32,
-    token_count: u32,
-) -> cache_reuse_utils::CandidateRange {
-    cache_reuse_utils::CandidateRange {
+fn range(source_start: u32, destination_start: u32, token_count: u32) -> PlacedRange {
+    PlacedRange {
         source_start,
         destination_start,
         token_count,
+        prepared_start: destination_start,
     }
 }
 
@@ -135,8 +133,8 @@ fn invalid_minimum_and_k_are_preparation_errors() {
     let min_zero = run(&[1], &[1], 0, 1).expect_err("zero minimum");
     assert!(matches!(
         min_zero,
-        PlanError::InvalidInput {
-            reason: ContractError::InvalidMinimum { minimum: 0 },
+        PlanError {
+            kind: PlanErrorKind::InvalidInput(ContractError::InvalidMinimum { minimum: 0 }),
             stage: AnalysisStage::Preparation,
             timing,
         } if timing.discovery().is_none()
@@ -147,8 +145,8 @@ fn invalid_minimum_and_k_are_preparation_errors() {
     let bad_k = run(&[1], &[1], 1, 0).expect_err("zero K");
     assert!(matches!(
         bad_k,
-        PlanError::InvalidInput {
-            reason: ContractError::InvalidK { k: 0, .. },
+        PlanError {
+            kind: PlanErrorKind::InvalidInput(ContractError::InvalidK { k: 0, .. }),
             stage: AnalysisStage::Preparation,
             timing,
         } if timing.discovery().is_none()
@@ -176,7 +174,8 @@ fn cancellation_wins_before_discovery() {
     .expect_err("cancelled");
     assert!(matches!(
         error,
-        PlanError::Cancelled {
+        PlanError {
+            kind: PlanErrorKind::Cancelled,
             stage: AnalysisStage::Preparation,
             ..
         }
@@ -221,12 +220,12 @@ fn inputs_beyond_the_supported_envelope_are_admission_errors() {
     .expect_err("oversized context");
     assert!(matches!(
         error,
-        PlanError::AdmissionDenied {
-            reason: AdmissionDeniedReason::InputTooLarge {
+        PlanError {
+            kind: PlanErrorKind::AdmissionDenied(AdmissionDeniedReason::InputTooLarge {
                 side: InputSide::Context,
                 got: 1_048_577,
                 max: 1_048_576,
-            },
+            }),
             stage: AnalysisStage::Preparation,
             ..
         }
@@ -313,7 +312,8 @@ fn expiry_during_preparation_reports_budget_without_discovery_or_search() {
     .expect_err("preparation deadline");
     assert!(matches!(
         error,
-        PlanError::BudgetExhausted {
+        PlanError {
+            kind: PlanErrorKind::BudgetExhausted,
             stage: AnalysisStage::Preparation,
             timing,
         } if timing.discovery().is_none()

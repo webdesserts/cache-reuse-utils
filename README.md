@@ -38,8 +38,8 @@ assert_eq!(plan.cache_identity(), CacheIdentity::new(7));
 `analyze` validates the request, discovers maximal exact matches, and searches
 under one cooperative deadline. A valid plan is returned as `Ok` even when the
 deadline stops further work. Complete no-reuse is an empty plan. A deadline with
-no incumbent returns `PlanError::BudgetExhausted`; a variant/state exploration cap
-with no incumbent returns `PlanError::PlacementIncomplete`. Cancellation takes
+no incumbent returns `PlanErrorKind::BudgetExhausted`; a variant/state exploration
+cap with no incumbent returns `PlanErrorKind::PlacementIncomplete`. Cancellation takes
 precedence. The plan carries selected ranges, coverage, current-call insertion
 recipe, metrics/status, identity and timing. See the rustdoc for
 `PlacementPolicy`, `ReusePlan`, `PlanError` and `PlacementStatus` for the full

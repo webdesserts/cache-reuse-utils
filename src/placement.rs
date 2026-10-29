@@ -59,6 +59,12 @@ impl LossAllowance {
     pub const fn percent(self) -> f64 {
         self.basis_points as f64 / 100.0
     }
+
+    /// Smallest coverage within this allowance of `best`:
+    /// `best - floor(best * basis_points / 10_000)`.
+    pub(crate) fn floor(self, best: u64) -> u64 {
+        best - best.saturating_mul(self.basis_points as u64) / 10_000
+    }
 }
 
 impl Default for LossAllowance {
@@ -73,7 +79,7 @@ impl Default for LossAllowance {
 /// engineering bound, not a calibrated percentile of real workloads; real
 /// history measurement is still pending. A plan that reaches it is returned
 /// with [`PlacementStatus::VariantLimitReached`] when an incumbent exists, or
-/// [`crate::PlanError::PlacementIncomplete`] when no plan exists.
+/// [`crate::PlanErrorKind::PlacementIncomplete`] when no plan exists.
 pub const MAX_PLACEMENT_VARIANTS: usize = 4096;
 
 /// Provisional policy cap for this call's inserted padding.
@@ -633,11 +639,11 @@ pub enum PlacementStatus {
     /// The provisional variant budget was reached, so some declared trim
     /// variants or retained candidates were not derived/searched. A valid
     /// incumbent, if present, is returned with this status; otherwise analysis
-    /// returns [`crate::PlanError::PlacementIncomplete`].
+    /// returns [`crate::PlanErrorKind::PlacementIncomplete`].
     VariantLimitReached,
     /// The modeled placement payload was reached, so some state/extension work
     /// was not admitted. A valid incumbent, if present, is returned with this
-    /// status; otherwise analysis returns [`crate::PlanError::PlacementIncomplete`].
+    /// status; otherwise analysis returns [`crate::PlanErrorKind::PlacementIncomplete`].
     StateLimitReached,
 }
 
@@ -773,7 +779,7 @@ mod tests {
 
     #[test]
     fn loss_allowance_floor_examples_are_integer_and_documented() {
-        let floor = |best: u64, bp: u16| best - best.saturating_mul(bp as u64) / 10_000;
+        let floor = |best: u64, bp: u16| LossAllowance::from_basis_points(bp).floor(best);
         assert_eq!(floor(980, 1_000), 882);
         assert_eq!(floor(200, 1_000), 180);
         assert_eq!(floor(199, 1_000), 180);

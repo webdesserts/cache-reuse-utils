@@ -12,16 +12,5 @@ members = [".", "ffi"]
 default-members = ["."]
 resolver = "3"
 
-[dependencies]
-mock_instant = { version = "=0.6.1", optional = true }
-
-[features]
-test-support = ["dep:mock_instant"]
-
 [profile.release]
 panic = "unwind"
-
-[[test]]
-name = "test_support_clock"
-path = "tests/test_support_clock.rs"
-required-features = ["test-support"]

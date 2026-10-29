@@ -2,7 +2,7 @@
 
 use cache_reuse_utils::{
     AnalysisStage, CacheIdentity, CacheReuseAnalysis, CacheView, LossAllowance,
-    PlacementConfigError, PlacementPolicy, PlacementStatus, PlanError, ReusePlan,
+    PlacementConfigError, PlacementPolicy, PlacementStatus, PlanError, PlanErrorKind, ReusePlan,
 };
 use std::time::{Duration, Instant};
 
@@ -119,8 +119,10 @@ fn invalid_placement_policy_is_preparation_error() {
     let error = analyze(&[1, 2, 3, 4], &[1, 2, 3, 4], 4, 1, policy).expect_err("invalid allowance");
     assert!(matches!(
         error,
-        PlanError::InvalidPlacementPolicy {
-            reason: PlacementConfigError::InvalidLossAllowance { .. },
+        PlanError {
+            kind: PlanErrorKind::InvalidPlacementPolicy(
+                PlacementConfigError::InvalidLossAllowance { .. }
+            ),
             stage: AnalysisStage::Preparation,
             ..
         }
@@ -180,8 +182,8 @@ fn variant_limit_without_any_plan_is_an_informative_incomplete_error() {
     let error = analyze(&context, &cache, 4, 1, policy).expect_err("no feasible variant");
     assert!(matches!(
         error,
-        PlanError::PlacementIncomplete {
-            status: PlacementStatus::VariantLimitReached,
+        PlanError {
+            kind: PlanErrorKind::PlacementIncomplete(PlacementStatus::VariantLimitReached),
             stage: AnalysisStage::Search,
             ..
         }
@@ -249,8 +251,11 @@ fn supports_exactly_ten_selected_ranges_and_rejects_eleven() {
     .expect_err("eleven exceeds supported maximum");
     assert!(matches!(
         error,
-        PlanError::InvalidInput {
-            reason: cache_reuse_utils::ContractError::InvalidK { k: 11, max: 10 },
+        PlanError {
+            kind: PlanErrorKind::InvalidInput(cache_reuse_utils::ContractError::InvalidK {
+                k: 11,
+                max: 10
+            }),
             stage: AnalysisStage::Preparation,
             ..
         }
@@ -296,8 +301,10 @@ fn invalid_loss_allowance_inputs_fail_through_policy_validation() {
             .expect_err("out-of-range allowance");
         assert!(matches!(
             error,
-            PlanError::InvalidPlacementPolicy {
-                reason: PlacementConfigError::InvalidLossAllowance { .. },
+            PlanError {
+                kind: PlanErrorKind::InvalidPlacementPolicy(
+                    PlacementConfigError::InvalidLossAllowance { .. }
+                ),
                 ..
             }
         ));
@@ -325,8 +332,10 @@ fn padding_policy_constructor_requires_explicit_token_boundaries_and_capacity() 
         analyze(&[1, 2, 3, 4], &[1, 2, 3, 4], 4, 1, invalid).expect_err("capacity below target");
     assert!(matches!(
         error,
-        PlanError::InvalidPlacementPolicy {
-            reason: PlacementConfigError::InvalidCapacity { .. },
+        PlanError {
+            kind: PlanErrorKind::InvalidPlacementPolicy(
+                PlacementConfigError::InvalidCapacity { .. }
+            ),
             ..
         }
     ));
