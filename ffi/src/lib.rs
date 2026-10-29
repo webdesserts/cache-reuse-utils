@@ -10,8 +10,9 @@ use std::slice;
 use std::time::{Duration, Instant};
 
 use cache_reuse_utils::{
-    AnalysisTiming, CacheIdentity, CacheReuseAnalysis, CacheView, LossAllowance, PlacementPolicy,
-    PlacementStatus, PlanError, PlanErrorKind,
+    AllowedInsertions, AnalysisTiming, CacheIdentity, CacheReuseAnalysis, CacheView,
+    DEFAULT_PAD_PENALTY_TOKENS, LossAllowance, PlacementPolicy, PlacementStatus, PlanError,
+    PlanErrorKind,
 };
 
 pub const CACHE_REUSE_COMPLETE: u32 = 0;
@@ -71,6 +72,9 @@ pub struct CacheReuseConfig {
     pub allow_all_insertions: bool,
     pub allowed_insertions: *const u32,
     pub allowed_insertion_count: u32,
+    /// Covered tokens one inserted pad must buy back in plan selection.
+    /// 0 selects the default of 16 when padding is enabled.
+    pub pad_penalty_tokens: u32,
 }
 
 #[repr(C)]
@@ -181,18 +185,9 @@ unsafe fn copy_tokens(pointer: *const i32, len: u32, what: &str) -> Result<Vec<u
     Ok(output)
 }
 
-unsafe fn copy_allowed(config: &CacheReuseConfig, target_len: usize) -> Result<Vec<u32>, String> {
-    if config.allow_all_insertions {
-        let mut output = Vec::new();
-        output
-            .try_reserve_exact(target_len.saturating_add(1))
-            .map_err(|_| "insertion allocation refused")?;
-        for i in 0..=target_len {
-            output.push(u32::try_from(i).map_err(|_| "target length exceeds u32")?);
-        }
-        return Ok(output);
-    }
-    if config.allowed_insertion_count == 0 {
+/// Copy the caller's insertion boundaries. Unused when all are allowed.
+unsafe fn copy_allowed(config: &CacheReuseConfig) -> Result<Vec<u32>, String> {
+    if config.allow_all_insertions || config.allowed_insertion_count == 0 {
         return Ok(Vec::new());
     }
     if config.allowed_insertions.is_null() {
@@ -286,16 +281,20 @@ pub unsafe extern "C" fn cache_reuse_plan(
     cancel: Option<unsafe extern "C" fn(*mut c_void) -> bool>,
     cancel_ud: *mut c_void,
 ) -> i32 {
-    if result.is_null() || config.is_null() {
-        set_error(error, error_len, "null planner result/config");
+    if result.is_null() {
+        set_error(error, error_len, "null planner result");
         return 1;
     }
-    let config = unsafe { &*config };
     let result_ref = unsafe { &mut *result };
     *result_ref = CacheReuseResult {
         status: CACHE_REUSE_ERR_INVALID,
         ..Default::default()
     };
+    if config.is_null() {
+        set_error(error, error_len, "null planner config");
+        return 1;
+    }
+    let config = unsafe { &*config };
     let deadline = match Instant::now().checked_add(Duration::from_millis(config.budget_ms as u64))
     {
         Some(value) => value,
@@ -311,7 +310,7 @@ pub unsafe extern "C" fn cache_reuse_plan(
             if target.len() > u32::MAX as usize || source.len() > u32::MAX as usize {
                 return Err("input length exceeds u32".into());
             }
-            let allowed = unsafe { copy_allowed(config, target.len()) }?;
+            let allowed = unsafe { copy_allowed(config) }?;
             if config.max_ranges == 0 || config.max_ranges > CACHE_REUSE_MAX_RANGES as u32 {
                 return Err("invalid max_ranges".into());
             }
@@ -338,8 +337,18 @@ pub unsafe extern "C" fn cache_reuse_plan(
                     ),
                     protected_prefix_tokens: config.protected_prefix_tokens,
                     fresh_suffix_tokens: config.fresh_suffix_tokens,
-                    allowed_insertions: &allowed,
+                    allowed_insertions: if config.allow_all_insertions {
+                        AllowedInsertions::All
+                    } else {
+                        AllowedInsertions::Boundaries(&allowed)
+                    },
                     pad_token,
+                    pad_penalty_tokens: match config.pad_penalty_tokens {
+                        0 if pad_token.is_some() && config.max_new_padding > 0 => {
+                            DEFAULT_PAD_PENALTY_TOKENS
+                        }
+                        value => value,
+                    },
                     source_start_alignment: config.source_start_alignment,
                     prepared_target_start_alignment: config.prepared_target_start_alignment,
                     reuse_count_alignment: config.reuse_count_alignment,

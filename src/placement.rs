@@ -73,38 +73,41 @@ impl Default for LossAllowance {
     }
 }
 
-/// Provisional cap on generated placement variants.
+/// Default cap on placement variants derived from discovered matches.
 ///
-/// This bounds trim-variant derivation and retained candidate work. It is an
-/// engineering bound, not a calibrated percentile of real workloads; real
-/// history measurement is still pending. A plan that reaches it is returned
-/// with [`PlacementStatus::VariantLimitReached`] when an incumbent exists, or
-/// [`crate::PlanErrorKind::PlacementIncomplete`] when no plan exists.
+/// Reaching it returns the best plan found with
+/// [`PlacementStatus::VariantLimitReached`], or
+/// [`crate::PlanErrorKind::PlacementIncomplete`] when there is none.
 pub const MAX_PLACEMENT_VARIANTS: usize = 4096;
 
-/// Provisional policy cap for this call's inserted padding.
-///
-/// Padding is charged into score buckets, so this also bounds bucket-table
-/// footprint. It is not a calibrated workload percentile. This is a policy
-/// constraint, not an exploration-truncation limit: a caller's
-/// `max_new_padding` above the cap is an invalid policy, and a candidate that
-/// needs more than the declared/available padding is simply outside the
-/// declared feasible domain. That can yield a valid smaller plan, a complete
-/// `NoFeasibleReuse` empty plan, or no candidate; it does **not** by itself
-/// produce `PlacementIncomplete`. Variant and modeled-state limits own partial
-/// statuses and no-incumbent incomplete refusals.
+/// Largest accepted `max_new_padding`. A larger value is an invalid policy.
 pub const MAX_NEW_PADDING: u32 = 4096;
 
-/// Modeled placement state/recipe payload ceiling.
-///
-/// The search accounts retained variants, order-index `StateKey` entries,
-/// state/bucket plans and insertion capacities. Allocator overhead, the
-/// `HashMap` table and spare `Vec` capacity are excluded. This is a modeled
-/// planner-payload cap, not measured whole-process resident memory and not a
-/// GPU-allocation promise. Reaching it yields a truthful
-/// [`PlacementStatus::StateLimitReached`] incumbent or an incomplete refusal,
-/// never an invented empty plan.
-pub(crate) const MAX_PLACEMENT_BYTES: u64 = 32 * 1024 * 1024;
+/// Default `pad_penalty_tokens` for [`PlacementPolicy::with_padding`].
+pub const DEFAULT_PAD_PENALTY_TOKENS: u32 = 16;
+
+/// Original-target boundaries where this call may insert padding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllowedInsertions<'a> {
+    /// Any boundary `0..=context_len`.
+    All,
+    /// Only these boundaries, sorted and unique. Empty permits none.
+    Boundaries(&'a [u32]),
+}
+
+impl AllowedInsertions<'_> {
+    /// The latest permitted boundary in `low..=high`.
+    pub(crate) fn latest_in(&self, low: u32, high: u32) -> Option<u32> {
+        match *self {
+            Self::All => Some(high),
+            Self::Boundaries(boundaries) => {
+                let end = boundaries.partition_point(|&value| value <= high);
+                let boundary = *boundaries.get(end.checked_sub(1)?)?;
+                (boundary >= low).then_some(boundary)
+            }
+        }
+    }
+}
 
 /// Caller-declared placement constraints. All tokens are actual content; no
 /// token value is interpreted as padding.
@@ -112,21 +115,22 @@ pub(crate) const MAX_PLACEMENT_BYTES: u64 = 32 * 1024 * 1024;
 /// Use [`Self::without_padding`] for an intentional no-insertion analysis, or
 /// [`Self::with_padding`] when a caller supplies a pad token, allowed insertion
 /// boundaries and prepared capacity. Fields remain public for adapter-specific
-/// policy refinements such as native alignment.
+/// refinements such as native alignment.
 #[derive(Debug, Clone, Copy)]
 pub struct PlacementPolicy<'a> {
-    /// Relative useful-coverage loss allowed when choosing between plans.
+    /// Relative coverage loss accepted in exchange for less padding.
     pub loss_allowance: LossAllowance,
     /// Leading original-target tokens that must remain fresh.
     pub protected_prefix_tokens: u32,
     /// Trailing original-target tokens that must remain fresh.
     pub fresh_suffix_tokens: u32,
-    /// Original-target boundaries where insertion is permitted, sorted and
-    /// unique. An empty slice permits none unless the whole boundary space is
-    /// explicitly enabled by the caller.
-    pub allowed_insertions: &'a [u32],
+    /// Boundaries where this call may insert padding.
+    pub allowed_insertions: AllowedInsertions<'a>,
     /// Model-visible token for this call's insertions. `None` forbids padding.
     pub pad_token: Option<u32>,
+    /// Covered tokens one inserted pad must buy back. Selection maximizes
+    /// `covered - padding * pad_penalty_tokens` among eligible plans.
+    pub pad_penalty_tokens: u32,
     /// Required alignment of source-range starts.
     pub source_start_alignment: u32,
     /// Required alignment of prepared-target range starts.
@@ -142,27 +146,28 @@ pub struct PlacementPolicy<'a> {
     /// Maximum current-call padding. With [`Self::with_padding`] this is derived
     /// from spare prepared capacity and bounded by [`MAX_NEW_PADDING`].
     pub max_new_padding: u32,
-    /// Explicit bounded trim rectangle per maximal match. Derivation polls the
-    /// deadline/cancellation on every nested iteration; the variant budget is
-    /// the only truncation rule, not an alignment-only heuristic.
+    /// Extra left trims to try per match. Trims needed to clear a previous
+    /// range or meet alignment are always applied and need no allowance.
     pub max_trim_left: u32,
+    /// Extra right trims to try per match.
     pub max_trim_right: u32,
+    /// Cap on derived variants, in `1..=MAX_PLACEMENT_VARIANTS`.
     pub max_variants: usize,
 }
 
 impl<'a> PlacementPolicy<'a> {
     /// Construct a no-padding policy for `context_len`.
     ///
-    /// It forbids insertions, permits no insertion boundaries and caps prepared
-    /// tokens at the original target length. Alignments are one and no trimming
-    /// is requested.
+    /// It forbids insertions and caps prepared tokens at the original target
+    /// length. Alignments are one and no extra trims are tried.
     pub fn without_padding(context_len: usize) -> Self {
         Self {
             loss_allowance: LossAllowance::default(),
             protected_prefix_tokens: 0,
             fresh_suffix_tokens: 0,
-            allowed_insertions: &[],
+            allowed_insertions: AllowedInsertions::Boundaries(&[]),
             pad_token: None,
+            pad_penalty_tokens: 0,
             source_start_alignment: 1,
             prepared_target_start_alignment: 1,
             reuse_count_alignment: 1,
@@ -178,30 +183,23 @@ impl<'a> PlacementPolicy<'a> {
 
     /// Construct a padding-capable policy with caller-owned inputs.
     ///
-    /// `pad_token` is the model-visible token for this call's insertions.
-    /// `allowed_insertions` contains the original-target boundaries where the
-    /// caller permits insertion; it must be sorted and unique. `prepared_capacity`
-    /// is the total original-target-plus-padding capacity. The derived
+    /// `prepared_capacity` is the total original-target-plus-padding capacity;
     /// `max_new_padding` is the spare capacity, capped by [`MAX_NEW_PADDING`].
-    ///
-    /// Both constructors start with neutral alignment 1. A model that requires
-    /// a different alignment sets the public alignment fields explicitly. The
-    /// constructor does not choose a token or permit boundaries outside the
-    /// supplied slice. Invalid capacity or boundaries are rejected during
-    /// analysis.
+    /// Each pad costs [`DEFAULT_PAD_PENALTY_TOKENS`] covered tokens in
+    /// selection. Alignments start at 1; set the fields a model requires.
+    /// Invalid capacity or boundaries are rejected during analysis.
     ///
     /// ```
-    /// # use cache_reuse_utils::PlacementPolicy;
-    /// let policy = PlacementPolicy::with_padding(10, 99, &[0, 1], 11);
+    /// # use cache_reuse_utils::{AllowedInsertions, PlacementPolicy};
+    /// let policy = PlacementPolicy::with_padding(10, 99, AllowedInsertions::All, 11);
     /// assert_eq!(policy.pad_token, Some(99));
     /// assert_eq!(policy.max_new_padding, 1);
-    /// assert_eq!(policy.max_prepared_tokens, 11);
-    /// assert_eq!(policy.prepared_target_start_alignment, 1);
+    /// assert_eq!(policy.pad_penalty_tokens, 16);
     /// ```
     pub fn with_padding(
         context_len: usize,
         pad_token: u32,
-        allowed_insertions: &'a [u32],
+        allowed_insertions: AllowedInsertions<'a>,
         prepared_capacity: usize,
     ) -> Self {
         let max_new_padding = prepared_capacity
@@ -210,6 +208,7 @@ impl<'a> PlacementPolicy<'a> {
         let mut policy = Self::without_padding(context_len);
         policy.pad_token = Some(pad_token);
         policy.allowed_insertions = allowed_insertions;
+        policy.pad_penalty_tokens = DEFAULT_PAD_PENALTY_TOKENS;
         policy.max_prepared_tokens = prepared_capacity;
         policy.max_new_padding = max_new_padding;
         policy
@@ -257,8 +256,12 @@ impl<'a> PlacementPolicy<'a> {
         if self.max_new_padding > 0 && self.pad_token.is_none() {
             return Err(PlacementConfigError::MissingPadToken);
         }
+        let boundaries = match self.allowed_insertions {
+            AllowedInsertions::All => &[][..],
+            AllowedInsertions::Boundaries(boundaries) => boundaries,
+        };
         let mut previous = None;
-        for &boundary in self.allowed_insertions {
+        for &boundary in boundaries {
             if boundary as usize > context_len {
                 return Err(PlacementConfigError::InsertionBoundaryOutOfRange {
                     boundary,
@@ -454,22 +457,12 @@ impl PlacementRecipe {
         Ok(())
     }
 
-    /// Build and allocate the prepared target token buffer.
+    /// Build the prepared target token buffer.
     ///
-    /// The method walks the original target, inserts this recipe's pads at their
-    /// declared boundaries, and copies reused spans from the borrowed source.
-    /// Every copied reused token must equal the original target token at that
-    /// position; a mismatch or malformed recipe is returned as a typed
-    /// [`PlacementMaterializeError`]. The result is a new `Vec<u32>` owned by the
-    /// caller.
-    ///
-    /// This is a token-buffer materialization helper only. It does not install
-    /// or copy native cache tensors, validate model state, or run inference;
-    /// native execution remains an adapter responsibility. `context` is the
-    /// original target, not the prepared target. The returned buffer adds
-    /// `4 * (original_tokens + inserted_padding)` bytes of token payload; the
-    /// original target/source remain borrowed and live, while native KV/cache
-    /// tensors are separate. That is not a total peak-memory or RSS claim.
+    /// Walks the original `context`, inserts this recipe's pads at their
+    /// boundaries and copies reused spans from `source`. Every reused token
+    /// must equal the context token it replaces. This builds tokens only; it
+    /// does not touch native cache state.
     ///
     /// ```
     /// # use cache_reuse_utils::{CacheIdentity, Insertion, PlacedRange, PlacementRecipe};
@@ -585,12 +578,10 @@ pub struct PlacementPosition {
     pub after_insertions: u32,
 }
 
-/// Why a caller-constructed or caller-modified placement recipe was rejected.
+/// Why a recipe could not be validated or materialized.
 ///
-/// `RecipeShape` is the caller-facing structural error; `InputShape`,
-/// `SourceRange`, `ContentMismatch` and `Allocation` describe materialization
-/// inputs or allocation. These are not planner invariants: the planner's own
-/// recipe is checked separately before a `ReusePlan` is returned.
+/// `RecipeShape` means the recipe is structurally inconsistent; the other
+/// variants describe the inputs passed to [`PlacementRecipe::materialize`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlacementMaterializeError {
     InputShape,
@@ -619,31 +610,21 @@ pub struct PlacementMetrics {
     pub loss_allowance: LossAllowance,
 }
 
-/// Completeness/limit status for a returned plan.
+/// How completely search explored the placements for a returned plan.
 ///
-/// A status describes what the planner actually completed. A valid incumbent
-/// is still returned with `DeadlinePartial`, `VariantLimitReached` or
-/// `StateLimitReached`; if no incumbent exists, analysis returns an informative
-/// error instead of an empty success. Deadline expiry is cooperative and does
-/// not by itself bound memory.
+/// A partial status still carries the best valid plan found. Without one,
+/// analysis returns an error instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlacementStatus {
-    /// All declared variants and canonical placements were explored.
+    /// Every derived variant was searched.
     Complete,
-    /// No non-empty placement was feasible; the deliberate empty plan is
-    /// returned after complete exploration.
+    /// No non-empty placement was feasible; the plan is deliberately empty.
     NoFeasibleReuse,
-    /// Search stopped at the deadline after publishing a valid plan. Further
-    /// variants/states were not explored.
+    /// Search stopped at the deadline.
     DeadlinePartial,
-    /// The provisional variant budget was reached, so some declared trim
-    /// variants or retained candidates were not derived/searched. A valid
-    /// incumbent, if present, is returned with this status; otherwise analysis
-    /// returns [`crate::PlanErrorKind::PlacementIncomplete`].
+    /// The variant cap dropped some matches or trims.
     VariantLimitReached,
-    /// The modeled placement payload was reached, so some state/extension work
-    /// was not admitted. A valid incumbent, if present, is returned with this
-    /// status; otherwise analysis returns [`crate::PlanErrorKind::PlacementIncomplete`].
+    /// The plan-state cap stopped search.
     StateLimitReached,
 }
 
@@ -735,7 +716,7 @@ mod tests {
             Err(PlacementConfigError::MissingPadToken)
         );
         let mut policy = PlacementPolicy::without_padding(4);
-        policy.allowed_insertions = &[2, 1];
+        policy.allowed_insertions = AllowedInsertions::Boundaries(&[2, 1]);
         assert!(matches!(
             policy.validate(4),
             Err(PlacementConfigError::UnsortedInsertions { .. })
@@ -767,7 +748,7 @@ mod tests {
             Err(PlacementConfigError::PrefixSuffixOutOfRange)
         );
         let mut policy = PlacementPolicy::without_padding(4);
-        policy.allowed_insertions = &[5];
+        policy.allowed_insertions = AllowedInsertions::Boundaries(&[5]);
         assert!(matches!(
             policy.validate(4),
             Err(PlacementConfigError::InsertionBoundaryOutOfRange { .. })

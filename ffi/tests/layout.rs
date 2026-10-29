@@ -55,6 +55,7 @@ fn c_abi_layout_matches_expected_darwin_arm64_shape() {
     assert_eq!(offset_of!(CacheReuseConfig, allow_all_insertions), 68);
     assert_eq!(offset_of!(CacheReuseConfig, allowed_insertions), 72);
     assert_eq!(offset_of!(CacheReuseConfig, allowed_insertion_count), 80);
+    assert_eq!(offset_of!(CacheReuseConfig, pad_penalty_tokens), 84);
 
     assert_eq!(size_of::<CacheReuseResult>(), 352);
     assert_eq!(align_of::<CacheReuseResult>(), 8);

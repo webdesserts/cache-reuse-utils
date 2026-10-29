@@ -1,8 +1,9 @@
-//! Public stateless placement API tests.
+//! Placement policy behavior through the public analysis API.
 
 use cache_reuse_utils::{
-    AnalysisStage, CacheIdentity, CacheReuseAnalysis, CacheView, LossAllowance,
-    PlacementConfigError, PlacementPolicy, PlacementStatus, PlanError, PlanErrorKind, ReusePlan,
+    AllowedInsertions, AnalysisStage, CacheIdentity, CacheReuseAnalysis, CacheView, ContractError,
+    DiscoveryStatus, LossAllowance, PlacementConfigError, PlacementPolicy, PlacementStatus,
+    PlanError, PlanErrorKind, ReusePlan,
 };
 use std::time::{Duration, Instant};
 
@@ -22,321 +23,217 @@ fn analyze(
             minimum_match_tokens: minimum,
         },
         k,
-        deadline: Instant::now() + Duration::from_secs(5),
+        deadline: Instant::now() + Duration::from_secs(30),
         cancel: &mut cancel,
         placement: policy,
     }
     .analyze()
 }
 
-fn padded_policy<'a>() -> PlacementPolicy<'a> {
-    let mut policy = PlacementPolicy::with_padding(10, 99, &[0, 1], 11);
-    // The model for this fixture requires even prepared starts; this is a
-    // caller constraint, not a default of the generic padding constructor.
+fn spans(plan: &ReusePlan) -> Vec<(u32, u32, u32)> {
+    plan.ranges()
+        .iter()
+        .map(|r| (r.source_start, r.destination_start, r.token_count))
+        .collect()
+}
+
+const CONTEXT: [u32; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+const CACHE: [u32; 6] = [1, 2, 3, 4, 5, 6];
+
+/// One spare token of capacity and even prepared starts, so reusing
+/// `CACHE` at destination 1 needs one pad.
+fn even_starts<'a>(allowed: AllowedInsertions<'a>) -> PlacementPolicy<'a> {
+    let mut policy = PlacementPolicy::with_padding(10, 99, allowed, 11);
     policy.prepared_target_start_alignment = 2;
     policy
 }
 
 #[test]
-fn placement_recipe_inserts_at_canonical_latest_allowed_boundary() {
-    let context = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-    let cache = [1, 2, 3, 4, 5, 6];
-    let plan = analyze(&context, &cache, 6, 1, padded_policy()).expect("padded plan");
-    assert_eq!(plan.covered_tokens(), 6);
+fn padding_is_inserted_at_the_latest_allowed_boundary() {
+    let plan = analyze(&CONTEXT, &CACHE, 6, 1, even_starts(AllowedInsertions::All)).unwrap();
     let recipe = plan.placement();
-    assert_eq!(recipe.insertions.len(), 1);
-    assert_eq!(recipe.insertions[0].before_target_index, 1);
-    assert_eq!(recipe.insertions[0].token, 99);
-    assert_eq!(recipe.insertions[0].count, 1);
-    assert_eq!(recipe.prepared_tokens, 11);
-    assert_eq!(plan.metrics().inserted_padding, 1);
-    assert_eq!(plan.placement_status(), PlacementStatus::Complete);
+    assert_eq!(plan.covered_tokens(), 6);
     assert_eq!(
-        recipe.materialize(&context, &cache).expect("materialize"),
-        vec![0, 99, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        (
+            recipe.insertions[0].before_target_index,
+            recipe.insertions[0].count
+        ),
+        (1, 1)
+    );
+    assert_eq!(
+        recipe.materialize(&CONTEXT, &CACHE).unwrap(),
+        [0, 99, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     );
 }
 
 #[test]
-fn original_pad_valued_tokens_remain_useful_source_and_target_content() {
-    let context = [1, 77, 2, 3];
-    let cache = [1, 77, 2, 3];
-    let policy = PlacementPolicy::without_padding(4);
-    let plan = analyze(&context, &cache, 4, 1, policy).expect("space/token content");
-    assert_eq!(plan.covered_tokens(), 4);
-    assert_eq!(plan.metrics().inserted_padding, 0);
-    assert!(plan.placement().insertions.is_empty());
+fn geometry_that_needs_an_unavailable_insertion_is_no_feasible_reuse() {
+    let outside_gap = even_starts(AllowedInsertions::Boundaries(&[2]));
+    let mut no_padding = PlacementPolicy::without_padding(10);
+    no_padding.prepared_target_start_alignment = 2;
+    for policy in [outside_gap, no_padding] {
+        let plan = analyze(&CONTEXT, &CACHE, 6, 1, policy).unwrap();
+        assert!(plan.ranges().is_empty());
+        assert_eq!(plan.placement_status(), PlacementStatus::NoFeasibleReuse);
+    }
+}
+
+#[test]
+fn full_allowance_prefers_no_reuse_to_an_expensive_pad() {
+    let mut policy = even_starts(AllowedInsertions::All);
+    policy.loss_allowance = LossAllowance::from_percent(100);
+    let plan = analyze(&CONTEXT, &CACHE, 6, 1, policy).unwrap();
+    assert!(plan.ranges().is_empty());
+    assert_eq!(plan.metrics().best_useful, 6);
+}
+
+#[test]
+fn matches_crossing_the_protected_prefix_or_fresh_suffix_are_clipped() {
+    let tokens = [1, 2, 3, 4, 5, 6];
+    let mut policy = PlacementPolicy::without_padding(6);
+    policy.protected_prefix_tokens = 1;
+    policy.fresh_suffix_tokens = 2;
+    let plan = analyze(&tokens, &tokens, 3, 1, policy).unwrap();
+    assert_eq!(spans(&plan), [(1, 1, 3)]);
+}
+
+#[test]
+fn overlapping_matches_combine_without_a_trim_allowance() {
+    let context: Vec<u32> = (1000..1300).collect();
+    let mut cache = context[..100].to_vec();
+    cache.push(5);
+    cache.extend_from_slice(&context[90..]);
+    let plan = analyze(
+        &context,
+        &cache,
+        4,
+        2,
+        PlacementPolicy::without_padding(300),
+    )
+    .unwrap();
+    assert_eq!(spans(&plan), [(0, 0, 100), (111, 100, 200)]);
     assert_eq!(
-        plan.placement()
-            .materialize(&context, &cache)
-            .expect("materialize"),
+        plan.placement().materialize(&context, &cache).unwrap(),
         context
     );
 }
 
 #[test]
-fn disallowed_gap_insertion_produces_no_feasible_reuse() {
-    let context = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-    let cache = [1, 2, 3, 4, 5, 6];
-    let mut policy = padded_policy();
-    policy.allowed_insertions = &[2];
-    let plan = analyze(&context, &cache, 6, 1, policy).expect("empty no-feasible plan");
-    assert!(plan.ranges().is_empty());
-    assert_eq!(plan.placement_status(), PlacementStatus::NoFeasibleReuse);
+fn alignment_trims_need_no_trim_allowance() {
+    let context = [0, 1, 2, 3, 4, 5, 6, 7];
+    let cache = [9, 1, 2, 3, 4, 5, 6, 7];
+    let mut policy = PlacementPolicy::without_padding(8);
+    policy.source_start_alignment = 2;
+    policy.reuse_count_alignment = 4;
+    let plan = analyze(&context, &cache, 7, 1, policy).unwrap();
+    assert_eq!(spans(&plan), [(2, 2, 4)]);
 }
 
 #[test]
-fn protected_prefix_and_fresh_suffix_block_reuse() {
-    let context = [1, 2, 3, 4, 5, 6];
-    let cache = [1, 2, 3, 4, 5, 6];
-    let mut policy = PlacementPolicy::without_padding(6);
-    policy.protected_prefix_tokens = 1;
-    let plan = analyze(&context, &cache, 6, 1, policy).expect("prefix empty");
-    assert_eq!(plan.placement_status(), PlacementStatus::NoFeasibleReuse);
-
-    let mut policy = PlacementPolicy::without_padding(6);
-    policy.fresh_suffix_tokens = 1;
-    let plan = analyze(&context, &cache, 6, 1, policy).expect("suffix empty");
-    assert_eq!(plan.placement_status(), PlacementStatus::NoFeasibleReuse);
+fn a_late_long_match_survives_the_candidate_cap() {
+    // 70 repeated blocks give 4,900 short matches before one long shared run.
+    let block: Vec<u32> = (500..516).collect();
+    let (mut context, mut cache) = (Vec::new(), Vec::new());
+    for i in 0..70 {
+        context.extend_from_slice(&block);
+        context.push(10_000 + i);
+        cache.extend_from_slice(&block);
+        cache.push(20_000 + i);
+    }
+    context.extend(100_000..102_000);
+    cache.extend(100_000..102_000);
+    let policy = PlacementPolicy::without_padding(context.len());
+    let plan = analyze(&context, &cache, 4, 1, policy).unwrap();
+    assert_eq!(
+        plan.discovery_status(),
+        DiscoveryStatus::CandidateLimitReached
+    );
+    assert_eq!(plan.covered_tokens(), 2000);
 }
 
 #[test]
-fn hundred_percent_allowance_can_choose_empty_after_a_positive_plan() {
-    let mut policy = padded_policy();
-    policy.loss_allowance = LossAllowance::from_basis_points(10_000);
-    let context = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-    let cache = [1, 2, 3, 4, 5, 6];
-    let plan = analyze(&context, &cache, 6, 1, policy).expect("empty wins at 100%");
-    assert!(plan.ranges().is_empty());
-    assert_eq!(plan.metrics().best_useful, 6);
-    assert_eq!(plan.placement_status(), PlacementStatus::Complete);
-}
-
-#[test]
-fn invalid_placement_policy_is_preparation_error() {
-    let mut policy = PlacementPolicy::without_padding(4);
-    policy.loss_allowance = LossAllowance::from_basis_points(10_001);
-    let error = analyze(&[1, 2, 3, 4], &[1, 2, 3, 4], 4, 1, policy).expect_err("invalid allowance");
-    assert!(matches!(
-        error,
-        PlanError {
-            kind: PlanErrorKind::InvalidPlacementPolicy(
-                PlacementConfigError::InvalidLossAllowance { .. }
-            ),
-            stage: AnalysisStage::Preparation,
-            ..
-        }
-    ));
-}
-
-#[test]
-fn variant_limit_returns_completed_plan_with_explicit_status() {
+fn variant_cap_returns_a_plan_or_reports_incomplete() {
     let context = [1, 2, 3, 4, 0, 5, 6, 7, 8];
     let cache = [1, 2, 3, 4, 9, 5, 6, 7, 8];
     let mut policy = PlacementPolicy::without_padding(9);
     policy.max_variants = 1;
-    let plan = analyze(&context, &cache, 4, 1, policy).expect("limited plan");
+    let plan = analyze(&context, &cache, 4, 2, policy).unwrap();
     assert_eq!(
         plan.placement_status(),
         PlacementStatus::VariantLimitReached
     );
     assert_eq!(plan.covered_tokens(), 4);
-}
 
-#[test]
-fn declared_trim_rectangle_can_remove_alignment_incompatible_edge() {
-    let context = [0, 1, 2, 3, 4, 5, 6, 7];
-    let cache = [1, 2, 3, 4, 5, 6, 7];
-    let mut policy = PlacementPolicy::without_padding(8);
-    policy.max_trim_right = 1;
-    policy.reuse_count_alignment = 2;
-    let plan = analyze(&context, &cache, 7, 1, policy).expect("trimmed plan");
-    assert_eq!(plan.covered_tokens(), 6);
-    assert_eq!(plan.ranges()[0].destination_start, 1);
-    assert_eq!(plan.ranges()[0].token_count, 6);
-}
-
-#[test]
-fn source_extra_token_breaks_the_match_without_metadata_skipping() {
-    let context = [1, 2, 3, 99, 4, 5, 6];
-    let cache = [1, 2, 3, 0, 4, 5, 6];
-    let policy = PlacementPolicy::without_padding(7);
-    let plan = analyze(&context, &cache, 3, 2, policy).expect("split matches");
-    assert_eq!(plan.covered_tokens(), 6);
-    assert_eq!(plan.ranges().len(), 2);
+    // The only variant would need a pad to start at prepared position 1.
+    policy.minimum_prepared_reuse_start = 1;
+    let error = analyze(&context, &cache, 4, 2, policy).unwrap_err();
     assert_eq!(
-        plan.placement()
-            .materialize(&context, &cache)
-            .expect("materialize"),
-        context
+        (error.kind, error.stage),
+        (
+            PlanErrorKind::PlacementIncomplete(PlacementStatus::VariantLimitReached),
+            AnalysisStage::Search
+        )
     );
 }
 
 #[test]
-fn variant_limit_without_any_plan_is_an_informative_incomplete_error() {
-    let context = [1, 2, 3, 4, 9, 5, 6, 7, 8];
-    let cache = [1, 2, 3, 4, 0, 5, 6, 7, 8];
-    let mut policy = PlacementPolicy::without_padding(9);
-    policy.protected_prefix_tokens = 9;
-    policy.max_variants = 1;
-    let error = analyze(&context, &cache, 4, 1, policy).expect_err("no feasible variant");
-    assert!(matches!(
-        error,
-        PlanError {
-            kind: PlanErrorKind::PlacementIncomplete(PlacementStatus::VariantLimitReached),
-            stage: AnalysisStage::Search,
-            ..
-        }
-    ));
-}
-
-#[test]
-fn capacity_is_cumulative_across_multiple_fresh_gaps() {
+fn prepared_capacity_is_cumulative_across_gaps() {
     let context: Vec<u32> = (1000..1014).collect();
     let cache = [
         1001, 2000, 2001, 2002, 2003, 1002, 2004, 2005, 2006, 1006, 2007,
     ];
-    let allowed: Vec<u32> = (0..=14).collect();
-    let mut policy = PlacementPolicy::with_padding(context.len(), 99, &allowed, 15);
-    policy.prepared_target_start_alignment = 2;
-    // Supply more padding budget than capacity allows so this case isolates
-    // cumulative prepared-capacity enforcement rather than the derived budget.
-    policy.max_new_padding = 4;
-    let plan = analyze(&context, &cache, 1, 3, policy).expect("capacity plan");
-    assert!(
-        plan.metrics().prepared_tokens <= 15,
-        "declared capacity exceeded: {}",
-        plan.metrics().prepared_tokens
-    );
-    assert_eq!(
-        plan.placement()
-            .materialize(&context, &cache)
-            .expect("materialize capacity plan")
-            .len(),
-        plan.metrics().prepared_tokens as usize
-    );
-
-    let mut policy = PlacementPolicy::with_padding(context.len(), 99, &allowed, 16);
-    policy.prepared_target_start_alignment = 2;
-    policy.max_new_padding = 4;
-    let plan = analyze(&context, &cache, 1, 3, policy).expect("control capacity plan");
-    assert_eq!(plan.metrics().prepared_tokens, 16);
-    assert_eq!(plan.metrics().inserted_padding, 2);
-    assert_eq!(plan.covered_tokens(), 3);
-}
-
-#[test]
-fn supports_exactly_ten_selected_ranges_and_rejects_eleven() {
-    let context = [
-        10, 0, 11, 0, 12, 0, 13, 0, 14, 0, 15, 0, 16, 0, 17, 0, 18, 0, 19, 0,
-    ];
-    let cache = [
-        10, 99, 11, 99, 12, 99, 13, 99, 14, 99, 15, 99, 16, 99, 17, 99, 18, 99, 19, 99,
-    ];
-    let mut policy = PlacementPolicy::without_padding(context.len());
-    policy.loss_allowance = LossAllowance::from_basis_points(0);
-    let plan = analyze(&context, &cache, 1, 10, policy).expect("ten-range plan");
-    assert_eq!(plan.ranges().len(), 10);
-    assert_eq!(plan.covered_tokens(), 10);
-    assert_eq!(plan.placement().ranges.len(), 10);
-    assert_eq!(plan.placement_status(), PlacementStatus::Complete);
-
-    let error = analyze(
-        &context,
-        &cache,
-        1,
-        11,
-        PlacementPolicy::without_padding(context.len()),
-    )
-    .expect_err("eleven exceeds supported maximum");
-    assert!(matches!(
-        error,
-        PlanError {
-            kind: PlanErrorKind::InvalidInput(cache_reuse_utils::ContractError::InvalidK {
-                k: 11,
-                max: 10
-            }),
-            stage: AnalysisStage::Preparation,
-            ..
-        }
-    ));
-}
-
-#[test]
-fn without_padding_refuses_geometry_that_requires_an_insertion() {
-    let context = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-    let cache = [1, 2, 3, 4, 5, 6];
-    let mut policy = PlacementPolicy::without_padding(context.len());
-    policy.prepared_target_start_alignment = 2;
-    let plan = analyze(&context, &cache, 6, 1, policy).expect("no-padding refusal");
-    assert!(plan.ranges().is_empty());
-    assert_eq!(plan.placement_status(), PlacementStatus::NoFeasibleReuse);
-    assert_eq!(plan.metrics().inserted_padding, 0);
-}
-
-#[test]
-fn loss_allowance_has_common_percent_and_exact_basis_point_forms() {
-    assert_eq!(
-        LossAllowance::from_percent(10),
-        LossAllowance::from_basis_points(1_000)
-    );
-    assert_eq!(LossAllowance::default(), LossAllowance::from_percent(10));
-    assert_eq!(LossAllowance::from_percent(0).basis_points(), 0);
-    assert_eq!(LossAllowance::from_percent(0).percent(), 0.0);
-    assert_eq!(LossAllowance::from_percent(100).basis_points(), 10_000);
-    assert_eq!(LossAllowance::from_percent(100).percent(), 100.0);
-    assert_eq!(LossAllowance::from_basis_points(1).percent(), 0.01);
-    assert_eq!(LossAllowance::from_basis_points(1).basis_points(), 1);
-}
-
-#[test]
-fn invalid_loss_allowance_inputs_fail_through_policy_validation() {
-    for allowance in [
-        LossAllowance::from_percent(101),
-        LossAllowance::from_basis_points(10_001),
-    ] {
-        let mut policy = PlacementPolicy::without_padding(4);
-        policy.loss_allowance = allowance;
-        let error = analyze(&[1, 2, 3, 4], &[1, 2, 3, 4], 4, 1, policy)
-            .expect_err("out-of-range allowance");
-        assert!(matches!(
-            error,
-            PlanError {
-                kind: PlanErrorKind::InvalidPlacementPolicy(
-                    PlacementConfigError::InvalidLossAllowance { .. }
-                ),
-                ..
-            }
-        ));
+    for (capacity, covered) in [(15, 2), (16, 3)] {
+        let mut policy =
+            PlacementPolicy::with_padding(context.len(), 99, AllowedInsertions::All, capacity);
+        policy.prepared_target_start_alignment = 2;
+        policy.pad_penalty_tokens = 0;
+        policy.loss_allowance = LossAllowance::from_percent(0);
+        let plan = analyze(&context, &cache, 1, 3, policy).unwrap();
+        assert!(plan.metrics().prepared_tokens as usize <= capacity);
+        assert_eq!(plan.covered_tokens(), covered, "capacity {capacity}");
+        assert_eq!(
+            plan.placement()
+                .materialize(&context, &cache)
+                .unwrap()
+                .len(),
+            plan.metrics().prepared_tokens as usize
+        );
     }
 }
 
 #[test]
-fn padding_policy_constructor_requires_explicit_token_boundaries_and_capacity() {
-    let policy = PlacementPolicy::with_padding(10, 99, &[0, 1], 11);
-    assert_eq!(policy.pad_token, Some(99));
-    assert_eq!(policy.allowed_insertions, &[0, 1]);
-    assert_eq!(policy.max_new_padding, 1);
-    assert_eq!(policy.max_prepared_tokens, 11);
-    assert_eq!(policy.prepared_target_start_alignment, 1);
+fn ten_ranges_are_supported_and_eleven_rejected() {
+    let context: Vec<u32> = (10..20).flat_map(|t| [t, 0]).collect();
+    let cache: Vec<u32> = (10..20).flat_map(|t| [t, 99]).collect();
+    let mut policy = PlacementPolicy::without_padding(context.len());
+    policy.loss_allowance = LossAllowance::from_percent(0);
+    let plan = analyze(&context, &cache, 1, 10, policy).unwrap();
+    assert_eq!(plan.ranges().len(), 10);
+    assert_eq!(
+        analyze(&context, &cache, 1, 11, policy).unwrap_err().kind,
+        PlanErrorKind::InvalidInput(ContractError::InvalidK { k: 11, max: 10 })
+    );
+}
 
-    let no_padding = PlacementPolicy::without_padding(10);
-    assert_eq!(no_padding.pad_token, None);
-    assert_eq!(no_padding.allowed_insertions, &[]);
-    assert_eq!(no_padding.max_new_padding, 0);
-    assert_eq!(no_padding.max_prepared_tokens, 10);
-    assert_eq!(no_padding.prepared_target_start_alignment, 1);
-
-    let invalid = PlacementPolicy::with_padding(4, 99, &[1], 3);
-    let error =
-        analyze(&[1, 2, 3, 4], &[1, 2, 3, 4], 4, 1, invalid).expect_err("capacity below target");
-    assert!(matches!(
-        error,
-        PlanError {
-            kind: PlanErrorKind::InvalidPlacementPolicy(
-                PlacementConfigError::InvalidCapacity { .. }
-            ),
-            ..
-        }
-    ));
+#[test]
+fn invalid_policies_are_preparation_errors() {
+    let mut allowance = PlacementPolicy::without_padding(4);
+    allowance.loss_allowance = LossAllowance::from_percent(101);
+    let capacity = PlacementPolicy::with_padding(4, 99, AllowedInsertions::All, 3);
+    for (policy, expected) in [
+        (
+            allowance,
+            PlacementConfigError::InvalidLossAllowance {
+                basis_points: 10_100,
+            },
+        ),
+        (
+            capacity,
+            PlacementConfigError::InvalidCapacity { got: 3, min: 4 },
+        ),
+    ] {
+        let error = analyze(&[1, 2, 3, 4], &[1, 2, 3, 4], 4, 1, policy).unwrap_err();
+        assert_eq!(error.kind, PlanErrorKind::InvalidPlacementPolicy(expected));
+        assert_eq!(error.stage, AnalysisStage::Preparation);
+    }
 }

@@ -35,22 +35,21 @@ assert_eq!(plan.cache_identity(), CacheIdentity::new(7));
 # }
 ```
 
-`analyze` validates the request, discovers maximal exact matches, and searches
-under one cooperative deadline. A valid plan is returned as `Ok` even when the
-deadline stops further work. Complete no-reuse is an empty plan. A deadline with
-no incumbent returns `PlanErrorKind::BudgetExhausted`; a variant/state exploration
-cap with no incumbent returns `PlanErrorKind::PlacementIncomplete`. Cancellation takes
-precedence. The plan carries selected ranges, coverage, current-call insertion
-recipe, metrics/status, identity and timing. See the rustdoc for
-`PlacementPolicy`, `ReusePlan`, `PlanError` and `PlacementStatus` for the full
-contracts.
+`analyze` validates the request, keeps the 4,096 longest maximal exact matches,
+and searches placements under one cooperative deadline. Search seeds a greedy
+plan first, so a deadline still returns a good plan as `Ok` with a partial
+status. Without any plan, a deadline returns `PlanErrorKind::BudgetExhausted`
+and a variant or state cap returns `PlanErrorKind::PlacementIncomplete`.
+Cancellation always wins. No reuse is an empty plan.
 
-`PlacementPolicy::without_padding(target_len)` performs no insertions;
-`PlacementPolicy::with_padding(target_len, pad_token, allowed_boundaries,
-prepared_capacity)` enables caller-owned insertion. Both start at neutral
-alignment 1. `PlacementRecipe::materialize` builds the prepared target token
-buffer and checks reused-token equality against the borrowed source; it does not
-install native cache tensors or execute inference.
+`PlacementPolicy::without_padding(target_len)` performs no insertions.
+`PlacementPolicy::with_padding(target_len, pad_token, allowed, prepared_capacity)`
+lets search insert pad tokens to meet prepared-start alignment, and charges 16
+covered tokens per pad when choosing a plan (`pad_penalty_tokens`). Within the
+loss allowance (10% by default) of the best coverage, the plan with the most
+coverage net of that penalty wins. `PlacementRecipe::materialize` builds the
+prepared token buffer and checks every reused token against the source; it does
+not touch native cache state.
 
 ## C ABI
 
@@ -94,10 +93,10 @@ tokens with accompanying lengths; null input pointers are accepted only for zero
 lengths; config and result must be valid aligned pointers; cancellation is an
 optional C callback and must not unwind; pointers are not retained after the
 call. The function returns 0 for a produced plan, including an empty or partial
-plan, and nonzero otherwise. On the early null `config`/`result` rejection the
-function returns 1 and writes a best-effort error, but cannot promise a populated
-`result.status`. Error buffers are best effort. This package adds no aliasing,
-thread-reentrancy, or broader ownership guarantee.
+plan, and nonzero otherwise. Any non-null `result` is fully initialized,
+including when `config` is null. Error text is truncated to the buffer and
+NUL-terminated. `pad_penalty_tokens = 0` selects the default of 16 when padding
+is enabled.
 
 The optional `tools/check-header.sh` requires cbindgen 0.29.4 and checks the canonical header
 against a temporary generation; it is not part of ordinary builds.
@@ -127,7 +126,7 @@ References:
 
 ## Documentation and development
 
-- Rustdoc is the API reference: run `cargo doc --no-deps --all-features`.
-- [Design notes](docs/design.md) explain search and resource rationale.
-- [Research notes](docs/futurte-research.md) collect open evaluation questions.
+- Rustdoc is the API reference: run `cargo doc --no-deps`.
+- [Design notes](docs/design.md) explain the algorithm and its bounds.
+- [Behavior spec](specs/full-cache-analysis.feature) lists the contract scenarios.
 - [Contributing](CONTRIBUTING.md) lists build and test commands.

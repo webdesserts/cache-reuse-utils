@@ -30,8 +30,6 @@ pub enum AdmissionDeniedReason {
         got: usize,
         max: usize,
     },
-    /// The allocator refused a discovery index buffer.
-    Allocation,
 }
 
 /// What went wrong in a planning attempt.

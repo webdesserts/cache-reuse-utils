@@ -20,18 +20,11 @@ impl CacheIdentity {
     }
 }
 
-/// One borrowed, eligible actual-token cache source.
+/// One borrowed cache source of actual token IDs.
 ///
-/// `tokens` contains the actual token IDs represented by cached positions. Any
-/// historical artificial/intentional token is ordinary source content; the
-/// planner has no source layout/provenance and never classifies token values as
-/// padding. `minimum_match_tokens` is the smallest exact contiguous match that
-/// may become a candidate. It must be greater than zero; a minimum longer than
-/// an input simply means there can be no qualifying match.
-///
-/// Native integration still owns source pinning, physical positions, generation
-/// checks and execution. The identity is only binding metadata carried through
-/// the plan.
+/// Every token is ordinary content; the planner never treats a token value as
+/// padding. The engine adapter still owns pinning, physical positions and
+/// generation checks.
 #[derive(Debug, Clone, Copy)]
 pub struct CacheView<'a> {
     /// Actual token IDs in cached positions. This slice is borrowed only for

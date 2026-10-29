@@ -52,6 +52,7 @@ typedef struct {
   bool allow_all_insertions;
   const uint32_t *allowed_insertions;
   uint32_t allowed_insertion_count;
+  uint32_t pad_penalty_tokens;
 } cache_reuse_config;
 
 typedef struct {

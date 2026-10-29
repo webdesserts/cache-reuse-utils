@@ -1,84 +1,70 @@
 # Design notes
 
-This note explains the planner's search and resource model.
+How the planner finds and chooses a plan, and what bounds its work.
 
-## Discovery domain
+## Discovery
 
-The planner borrows one actual-token cache source and an original target. It
-discovers maximal exact contiguous matches at every target boundary, at least
-`minimum_match_tokens` long. These maximal matches are alternatives and may
-overlap; they are not an enumeration of every trimmed substring. A plan is
-complete only over the declared maximal-match, trim-rectangle and placement
-domain, not over every possible substring or native alignment.
+The planner borrows one cache of actual token IDs and the target context. It
+finds maximal exact matches at least `minimum_match_tokens` long inside the
+reusable window, between the protected prefix and the fresh suffix; a match
+that crosses either edge is clipped rather than dropped. Each cache window is
+hashed once and sorted. Every target window looks up equal hashes and verifies
+the tokens, so a hash collision never becomes a match. A per-diagonal end
+marker skips windows inside a match already found.
 
-Historical pad or whitespace tokens are ordinary token values. Only insertion
-records created by the current call are padding. Source coordinates, cache
-generations and physical placement remain adapter responsibilities.
+A bounded heap keeps the 4,096 longest matches, preferring earlier destination
+and source positions on ties. A long match found late is therefore never
+displaced by many short early ones. Dropping any match sets
+`DiscoveryStatus::CandidateLimitReached`.
 
-## Placement and search
+Historical pad tokens are ordinary content. Only this call's insertions are
+padding.
 
-Each maximal match can be trimmed within the policy's bounded left/right
-rectangle. The search places a valid range into a fresh gap at the canonical
-latest permitted boundary, using the smallest current-call padding that satisfies
-the declared alignments and minimum prepared start. Adjacent compatible ranges
-are coalesced and consume one final K slot; non-adjacent ranges consume separate
-slots. Final ranges are ordered, non-crossing and non-overlapping.
+## Search
 
-The search proceeds in stages:
+Each match yields an untrimmed variant, then any extra trims the policy asks
+for, up to `max_variants`. Variants are searched in destination order. Placing
+a variant after a previous range left-trims it just enough to start after that
+range in both target and source, then to source-start and count alignment. So
+overlapping matches combine without a trim allowance. The placement then takes
+the smallest padding that meets prepared-start alignment and the minimum
+prepared start, inserted at the latest allowed boundary in the gap. Ranges that
+continue each other on one diagonal coalesce and use one of the `k` slots.
 
-1. derive the bounded trim variants;
-2. place variants and extend valid plans, respecting prefix/suffix, capacity and
-   insertion permissions;
-3. publish completed best-by-padding plans into buckets while retaining
-   extension frontiers in separate states;
-4. compute the best useful coverage `B` and the relative admissible floor;
-5. choose the least-padding eligible completed plan.
+Every partial plan is a label in an arena: the placed piece, a parent index
+and running totals. Labels are deduplicated per variant by
+`(ranges, padding, end)`, keeping the best coverage, because nothing else
+affects how a plan can be extended. The winning plan is rebuilt once from its
+parent chain.
 
-The achievable floor is `B - floor(B * basis_points / 10000)`. Within that floor,
-the planner minimizes current-call padding, then maximizes useful tokens, then
-prefers fewer final ranges and stable lexicographic order. A high-coverage
-fallback prevents an early below-floor incumbent from hiding a later better
-plan. Buckets store completed plans; extension states may continue to grow.
-Publishing a completed bucket before admitting its extension state keeps the
-valid incumbent available if later modeled state admission reaches its limit.
+Before that search, a greedy pass adds variants longest first while coverage
+improves. A deadline or cap therefore still returns a plan built from the
+longest matches, not just the leftmost ones.
 
-## Deadline, cancellation and limits
+## Selection
 
-Analysis uses one absolute monotonic deadline and a caller cancellation callback.
-Cancellation wins at each checkpoint. The deadline is cooperative; it is checked
-at natural discovery/search iterations and phase boundaries. A valid incumbent is
-returned with a partial status when a deadline or exploration cap stops further
-search. Without an incumbent, deadline exhaustion is a typed error rather than an
-empty plan. Exact stage timing is recorded for telemetry.
+Let `B` be the best coverage found. Plans covering at least
+`B - floor(B * loss_basis_points / 10000)` are eligible. Among them the planner
+maximizes `covered - padding * pad_penalty_tokens`, then prefers less padding,
+more coverage and fewer ranges. When the floor is zero and the winner's
+coverage does not exceed its pad cost, it returns the empty plan instead.
 
-A bag of candidates is not an incumbent. Discovery may stop at its candidate
-capacity while retaining verified matches. Variant and modeled-state caps are
-exploration/resource limits: with a valid incumbent they produce a partial status,
-and without one they produce an incomplete refusal.
+## Bounds
 
-A configured `max_new_padding` above `MAX_NEW_PADDING` is invalid policy. A
-candidate requiring more padding than the caller's declared `max_new_padding` is
-outside the feasible domain; that may yield a smaller valid plan or a complete
-no-reuse result, but it is not a policy error and does not by itself produce an
-incomplete refusal.
+- Inputs are capped at 2^20 tokens per side.
+- Discovery keeps at most 4,096 matches, and derivation at most `max_variants`
+  (default 4,096) variants.
+- Search keeps at most 65,536 labels and stops with `StateLimitReached` beyond
+  that.
+- Deadline and cancellation checks run at stage boundaries and every 4,096
+  inner-loop steps. There is no timer thread. Cancellation is checked first, so
+  it always wins.
 
-Placement admission uses the actual modeled variant/state/recipe payload, not a
-dense closed-form worst case. The publication reserve covers the maximum modeled
-bucket payload; bucket storage is retained so a later state limit cannot discard a
-completed plan already found. Allocator overhead and hash-table/spare-capacity
-details are outside that model. The three numeric caps are provisional engineering
-bounds; they are not calibrated workload percentiles and real-history measurement
-is still pending.
+Search over all label pairs is quadratic in the worst case. At 4,000 variants
+and `k = 10` a full search takes about a second in release builds. The deadline
+bounds it, and the greedy incumbent gives a strong plan early.
 
 ## Validity boundary
 
-Structural and token-content checks are not equivalence proofs. A valid plan does
-not establish that native cache state matches the source, that physical positions
-are executable, or that model-state reuse is safe. The adapter must revalidate
-tokens, bounds, alignments, generations and cache eligibility before execution.
-
-## Deferred work
-
-Native projection/pinning and execution are separate adapter work. Parallel or
-interleaved search, alternative fallback policies, coverage-by-K reporting and
-performance calibration are not part of this planner revision.
+A plan is a structural proposal. The engine adapter must still check tokens,
+bounds, alignments and cache generations against native state before using it.

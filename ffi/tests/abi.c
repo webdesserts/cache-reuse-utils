@@ -29,6 +29,7 @@ CHECK_OFF(cache_reuse_config, variant_limit, 60); CHECK_OFF(cache_reuse_config, 
 CHECK_OFF(cache_reuse_config, allow_all_insertions, 68);
 CHECK_OFF(cache_reuse_config, allowed_insertions, 72);
 CHECK_OFF(cache_reuse_config, allowed_insertion_count, 80);
+CHECK_OFF(cache_reuse_config, pad_penalty_tokens, 84);
 CHECK_SIZE(cache_reuse_result, 352); CHECK_ALIGN(cache_reuse_result, 8);
 CHECK_OFF(cache_reuse_result, status, 0); CHECK_OFF(cache_reuse_result, covered_tokens, 4);
 CHECK_OFF(cache_reuse_result, inserted_padding, 8); CHECK_OFF(cache_reuse_result, prepared_tokens, 12);

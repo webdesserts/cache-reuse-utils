@@ -92,7 +92,10 @@ fn run(
     stopper.check().map_err(|stop| fail(stopper, stop))?;
 
     stopper.enter_discovery();
-    let discovery = discover(context, cache, stopper).map_err(|kind| fail(stopper, kind))?;
+    let window = policy.protected_prefix_tokens as usize
+        ..context.len() - policy.fresh_suffix_tokens as usize;
+    let discovery =
+        discover(context, window, cache, stopper).map_err(|stop| fail(stopper, stop))?;
     if discovery.ranges.is_empty() {
         stopper.check().map_err(|stop| fail(stopper, stop))?;
         return finish(context, &cache, discovery.status, empty(), policy, stopper);
@@ -150,7 +153,7 @@ fn cannot_match(context: &[u32], cache: &CacheView<'_>) -> bool {
 }
 
 fn empty() -> PlacementOutcome {
-    PlacementOutcome::empty(0, crate::placement::PlacementStatus::Complete)
+    PlacementOutcome::empty(0, crate::placement::PlacementStatus::NoFeasibleReuse)
 }
 
 fn finish(

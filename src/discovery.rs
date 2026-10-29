@@ -1,9 +1,12 @@
 //! Exact maximal-match discovery over one cache source.
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+use std::ops::Range;
+
 use crate::cache_view::CacheView;
 use crate::candidate::{CandidateRange, MAX_CANDIDATES};
-use crate::error::{AdmissionDeniedReason, PlanErrorKind};
-use crate::timing::Stopper;
+use crate::timing::{Stop, Stopper};
 
 /// Each input is capped at 1,048,576 tokens to bound index time and memory.
 /// This is a planner limit, not a native execution limit.
@@ -20,111 +23,23 @@ pub enum DiscoveryStatus {
     CandidateLimitReached,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Seed {
-    hash: u64,
-    source: u32,
-}
-
 pub(crate) struct DiscoveryOutcome {
     pub ranges: Vec<CandidateRange>,
     pub status: DiscoveryStatus,
 }
 
-fn seed_key(seed: &Seed) -> (u64, u32) {
-    (seed.hash, seed.source)
-}
-
-fn window_hash(
-    tokens: &[u32],
-    start: usize,
-    minimum: usize,
-    stopper: &mut Stopper<'_>,
-) -> Result<u64, PlanErrorKind> {
-    let mut hash = 0u64;
-    for token in &tokens[start..start + minimum] {
-        stopper.tick()?;
-        hash = hash.wrapping_mul(HASH_BASE).wrapping_add(*token as u64 + 1);
-    }
-    Ok(hash)
+fn window_hash(tokens: &[u32], start: usize, minimum: usize) -> u64 {
+    tokens[start..start + minimum]
+        .iter()
+        .fold(0u64, |hash, &token| {
+            hash.wrapping_mul(HASH_BASE).wrapping_add(token as u64 + 1)
+        })
 }
 
 fn update_hash(hash: u64, outgoing: u32, incoming: u32, power: u64) -> u64 {
     hash.wrapping_mul(HASH_BASE)
         .wrapping_add(incoming as u64 + 1)
         .wrapping_sub((outgoing as u64 + 1).wrapping_mul(power))
-}
-
-/// Sort seeds by `(hash, source)`, checking for a stop while partitioning.
-fn sort_seeds(seeds: &mut [Seed], stopper: &mut Stopper<'_>) -> Result<(), PlanErrorKind> {
-    fn insertion(slice: &mut [Seed], stopper: &mut Stopper<'_>) -> Result<(), PlanErrorKind> {
-        for i in 1..slice.len() {
-            let mut j = i;
-            while j > 0 && seed_key(&slice[j - 1]) > seed_key(&slice[j]) {
-                slice.swap(j - 1, j);
-                j -= 1;
-                stopper.tick()?;
-            }
-            stopper.tick()?;
-        }
-        Ok(())
-    }
-
-    fn quicksort(mut slice: &mut [Seed], stopper: &mut Stopper<'_>) -> Result<(), PlanErrorKind> {
-        const SMALL: usize = 24;
-        loop {
-            if slice.len() <= SMALL {
-                return insertion(slice, stopper);
-            }
-            let mid = slice.len() / 2;
-            let pivot = seed_key(&slice[mid]);
-            let mut less = 0;
-            let mut equal = 0;
-            let mut greater = slice.len();
-            while equal < greater {
-                let key = seed_key(&slice[equal]);
-                if key < pivot {
-                    slice.swap(less, equal);
-                    less += 1;
-                    equal += 1;
-                } else if key > pivot {
-                    greater -= 1;
-                    slice.swap(equal, greater);
-                } else {
-                    equal += 1;
-                }
-                stopper.tick()?;
-            }
-            // Recurse into the smaller partition and loop over the larger one,
-            // so recursion depth is O(log N).
-            if less <= slice.len() - greater {
-                quicksort(&mut slice[..less], stopper)?;
-                slice = &mut slice[greater..];
-            } else {
-                quicksort(&mut slice[greater..], stopper)?;
-                slice = &mut slice[..less];
-            }
-        }
-    }
-
-    quicksort(seeds, stopper)
-}
-
-fn exact_prefix(
-    source: &[u32],
-    source_start: usize,
-    target: &[u32],
-    target_start: usize,
-    minimum: usize,
-    stopper: &mut Stopper<'_>,
-) -> Result<bool, PlanErrorKind> {
-    for offset in 0..minimum {
-        stopper.tick()?;
-        if source[source_start + offset] != target[target_start + offset] {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 fn extend_match(
@@ -134,117 +49,159 @@ fn extend_match(
     target_start: usize,
     minimum: usize,
     stopper: &mut Stopper<'_>,
-) -> Result<(usize, usize, usize), PlanErrorKind> {
+) -> Result<(usize, usize, usize), Stop> {
     let mut left = 0usize;
-    while source_start > left && target_start > left {
+    while source_start > left
+        && target_start > left
+        && source[source_start - left - 1] == target[target_start - left - 1]
+    {
         stopper.tick()?;
-        if source[source_start - left - 1] != target[target_start - left - 1] {
-            break;
-        }
         left += 1;
     }
     let mut right = minimum;
-    while source_start + right < source.len() && target_start + right < target.len() {
+    while source_start + right < source.len()
+        && target_start + right < target.len()
+        && source[source_start + right] == target[target_start + right]
+    {
         stopper.tick()?;
-        if source[source_start + right] != target[target_start + right] {
-            break;
-        }
         right += 1;
     }
     Ok((source_start - left, target_start - left, left + right))
 }
 
-/// Discover every maximal exact match at least `cache.minimum_match_tokens`
-/// long.
+/// Candidate rank: longer is better, then earlier destination, then earlier
+/// source. The outer `Reverse` puts the weakest retained candidate on top of
+/// the max-heap.
+type Rank = Reverse<(u32, Reverse<u32>, Reverse<u32>)>;
+
+/// Retains the [`MAX_CANDIDATES`] best-ranked matches seen.
+#[derive(Default)]
+struct Longest {
+    heap: BinaryHeap<Rank>,
+    dropped: bool,
+}
+
+impl Longest {
+    fn push(&mut self, range: CandidateRange) {
+        let entry = Reverse((
+            range.token_count,
+            Reverse(range.destination_start),
+            Reverse(range.source_start),
+        ));
+        if self.heap.len() < MAX_CANDIDATES {
+            self.heap.push(entry);
+            return;
+        }
+        self.dropped = true;
+        if let Some(mut weakest) = self.heap.peek_mut()
+            && entry < *weakest
+        {
+            *weakest = entry;
+        }
+    }
+
+    fn into_outcome(self) -> DiscoveryOutcome {
+        let mut ranges: Vec<CandidateRange> = self
+            .heap
+            .into_iter()
+            .map(
+                |Reverse((token_count, Reverse(destination_start), Reverse(source_start)))| {
+                    CandidateRange {
+                        source_start,
+                        destination_start,
+                        token_count,
+                    }
+                },
+            )
+            .collect();
+        ranges.sort_unstable_by_key(|range| (range.destination_start, range.source_start));
+        DiscoveryOutcome {
+            ranges,
+            status: if self.dropped {
+                DiscoveryStatus::CandidateLimitReached
+            } else {
+                DiscoveryStatus::Complete
+            },
+        }
+    }
+}
+
+/// Discover maximal exact matches at least `cache.minimum_match_tokens` long
+/// inside `window` of the context, keeping the [`MAX_CANDIDATES`] longest.
 ///
-/// Every source and target position is a seed. Hash equality is only a
-/// filter: each seed pair is verified token by token. A per-diagonal coverage
-/// end skips windows inside an already-found maximal run. The caller has
-/// already rejected inputs that cannot match.
+/// Matches are maximal within the window: a match that crosses the protected
+/// prefix or fresh suffix is clipped to the reusable part before ranking.
+/// Every source position is a seed; hash equality is only a filter, and each
+/// seed pair is verified token by token. A per-diagonal coverage end skips
+/// windows inside an already-found run. Destinations are in full-context
+/// coordinates.
 pub(crate) fn discover(
     context: &[u32],
+    window: Range<usize>,
     cache: CacheView<'_>,
     stopper: &mut Stopper<'_>,
-) -> Result<DiscoveryOutcome, PlanErrorKind> {
+) -> Result<DiscoveryOutcome, Stop> {
+    let offset = window.start;
+    let target = &context[window];
     let minimum = cache.minimum_match_tokens as usize;
     let source = cache.tokens;
-    let source_windows = source.len() - minimum + 1;
-    let covered_len = source.len() + context.len() + 1;
-
-    let mut seeds = Vec::new();
-    seeds
-        .try_reserve_exact(source_windows)
-        .map_err(|_| PlanErrorKind::AdmissionDenied(AdmissionDeniedReason::Allocation))?;
-    let mut covered = Vec::new();
-    covered
-        .try_reserve_exact(covered_len)
-        .map_err(|_| PlanErrorKind::AdmissionDenied(AdmissionDeniedReason::Allocation))?;
-    let mut ranges = Vec::new();
-
-    let mut power = 1u64;
-    for _ in 0..minimum {
-        power = power.wrapping_mul(HASH_BASE);
+    let mut longest = Longest::default();
+    if minimum > target.len() || minimum > source.len() {
+        return Ok(longest.into_outcome());
     }
-    let mut hash = window_hash(source, 0, minimum, stopper)?;
-    for i in 0..source_windows {
+
+    let power = (0..minimum).fold(1u64, |power, _| power.wrapping_mul(HASH_BASE));
+    let mut seeds = Vec::with_capacity(source.len() - minimum + 1);
+    let mut hash = window_hash(source, 0, minimum);
+    for i in 0..=source.len() - minimum {
         stopper.tick()?;
         if i > 0 {
             hash = update_hash(hash, source[i - 1], source[i + minimum - 1], power);
         }
-        seeds.push(Seed {
-            hash,
-            source: i as u32,
-        });
+        seeds.push((hash, i as u32));
     }
-    sort_seeds(&mut seeds, stopper)?;
+    seeds.sort_unstable();
+    stopper.check()?;
 
-    for _ in 0..covered_len {
-        stopper.tick()?;
-        covered.push(0u32);
-    }
-
-    let mut target_hash = window_hash(context, 0, minimum, stopper)?;
-    let target_windows = context.len() - minimum + 1;
-    for destination in 0..target_windows {
+    // Diagonal `source - destination + target.len()` -> end of the last match
+    // found on it, in target coordinates.
+    let mut covered = vec![0u32; source.len() + target.len() + 1];
+    let mut target_hash = window_hash(target, 0, minimum);
+    for destination in 0..=target.len() - minimum {
         stopper.tick()?;
         if destination > 0 {
             target_hash = update_hash(
                 target_hash,
-                context[destination - 1],
-                context[destination + minimum - 1],
+                target[destination - 1],
+                target[destination + minimum - 1],
                 power,
             );
         }
-        let mut pair = seeds.partition_point(|seed| seed.hash < target_hash);
-        while pair < seeds.len() && seeds[pair].hash == target_hash {
-            stopper.tick()?;
-            let source_start = seeds[pair].source as usize;
-            let diagonal = source_start + context.len() - destination;
-            if covered[diagonal] < (destination + minimum) as u32
-                && exact_prefix(source, source_start, context, destination, minimum, stopper)?
-            {
-                let (start, begin, count) =
-                    extend_match(source, source_start, context, destination, minimum, stopper)?;
-                covered[diagonal] = (begin + count) as u32;
-                if ranges.len() == MAX_CANDIDATES {
-                    return Ok(DiscoveryOutcome {
-                        ranges,
-                        status: DiscoveryStatus::CandidateLimitReached,
-                    });
-                }
-                ranges.push(CandidateRange {
-                    source_start: start as u32,
-                    destination_start: begin as u32,
-                    token_count: count as u32,
-                });
+        let first = seeds.partition_point(|&(hash, _)| hash < target_hash);
+        for &(hash, source_start) in &seeds[first..] {
+            if hash != target_hash {
+                break;
             }
-            pair += 1;
+            stopper.tick()?;
+            let source_start = source_start as usize;
+            let diagonal = source_start + target.len() - destination;
+            if covered[diagonal] >= (destination + minimum) as u32
+                || source[source_start..source_start + minimum]
+                    != target[destination..destination + minimum]
+            {
+                continue;
+            }
+            let (start, begin, count) =
+                extend_match(source, source_start, target, destination, minimum, stopper)?;
+            covered[diagonal] = (begin + count) as u32;
+            longest.push(CandidateRange {
+                source_start: start as u32,
+                destination_start: (offset + begin) as u32,
+                token_count: count as u32,
+            });
         }
     }
-    Ok(DiscoveryOutcome {
-        ranges,
-        status: DiscoveryStatus::Complete,
-    })
+    Ok(longest.into_outcome())
 }
 
 #[cfg(test)]
@@ -254,7 +211,9 @@ mod tests {
     use std::collections::BTreeSet;
     use std::time::{Duration, Instant};
 
-    fn discover_ranges(source: &[u32], target: &[u32], minimum: u32) -> Vec<CandidateRange> {
+    type Found = BTreeSet<(u32, u32, u32)>;
+
+    fn discover_in(source: &[u32], target: &[u32], window: Range<usize>, minimum: u32) -> Found {
         let mut cancel = || false;
         let mut stopper = Stopper::new(Instant::now() + Duration::from_secs(5), &mut cancel);
         let cache = CacheView {
@@ -262,95 +221,65 @@ mod tests {
             identity: CacheIdentity::new(1),
             minimum_match_tokens: minimum,
         };
-        discover(target, cache, &mut stopper)
+        discover(target, window, cache, &mut stopper)
             .expect("discovery")
             .ranges
+            .into_iter()
+            .map(|r| (r.source_start, r.destination_start, r.token_count))
+            .collect()
     }
 
-    fn maximal_oracle(source: &[u32], target: &[u32], minimum: usize) -> BTreeSet<(u32, u32, u32)> {
-        let mut matches = BTreeSet::new();
-        for source_start in 0..source.len() {
-            for target_start in 0..target.len() {
-                if source[source_start] != target[target_start] {
+    /// Brute force: every match that cannot extend left or right inside the
+    /// window, at least `minimum` long.
+    fn oracle(source: &[u32], target: &[u32], window: Range<usize>, minimum: usize) -> Found {
+        let mut found = BTreeSet::new();
+        for s in 0..source.len() {
+            for t in window.clone() {
+                if s > 0 && t > window.start && source[s - 1] == target[t - 1] {
                     continue;
                 }
-                if source_start > 0
-                    && target_start > 0
-                    && source[source_start - 1] == target[target_start - 1]
-                {
-                    continue;
+                let mut n = 0;
+                while s + n < source.len() && t + n < window.end && source[s + n] == target[t + n] {
+                    n += 1;
                 }
-                let mut count = 0usize;
-                while source_start + count < source.len()
-                    && target_start + count < target.len()
-                    && source[source_start + count] == target[target_start + count]
-                {
-                    count += 1;
-                }
-                if count >= minimum {
-                    matches.insert((source_start as u32, target_start as u32, count as u32));
+                if n >= minimum {
+                    found.insert((s as u32, t as u32, n as u32));
                 }
             }
         }
-        matches
+        found
     }
 
     #[test]
-    fn maximal_matches_are_exact_and_complete_on_small_inputs() {
+    fn finds_every_maximal_match_inside_the_window() {
         let mut state = 0x9e37_79b9u64;
         let mut next = || {
             state = state
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            ((state >> 33) % 5) as u32
+            ((state >> 33) % 4) as u32
         };
-        for case in 0..80 {
-            let source_len = 1 + (case % 7);
-            let target_len = 1 + ((case / 7) % 7);
-            let source: Vec<u32> = (0..source_len).map(|_| next()).collect();
-            let target: Vec<u32> = (0..target_len).map(|_| next()).collect();
+        for case in 0..200usize {
+            let source: Vec<u32> = (0..1 + case % 9).map(|_| next()).collect();
+            let target: Vec<u32> = (0..1 + (case / 9) % 9).map(|_| next()).collect();
+            let start = case % 3 % (target.len() + 1);
+            let end = target.len() - (case / 3 % 2).min(target.len() - start);
             let minimum = 1 + (case % 3) as u32;
-            if minimum as usize > source_len || minimum as usize > target_len {
-                continue;
-            }
-            let actual: BTreeSet<_> = discover_ranges(&source, &target, minimum)
-                .into_iter()
-                .map(|r| (r.source_start, r.destination_start, r.token_count))
-                .collect();
-            let expected = maximal_oracle(&source, &target, minimum as usize);
-            assert_eq!(actual, expected, "case {case}");
+            assert_eq!(
+                discover_in(&source, &target, start..end, minimum),
+                oracle(&source, &target, start..end, minimum as usize),
+                "case {case}"
+            );
         }
     }
 
     #[test]
-    fn seed_sort_stops_on_cancellation() {
-        let base = Instant::now();
-        let mut seeds: Vec<Seed> = (0..5_000u32)
-            .rev()
-            .map(|source| Seed {
-                hash: source as u64,
-                source,
-            })
-            .collect();
-        let mut cancel = || true;
-        let mut stopper =
-            Stopper::with_clock(base + Duration::from_secs(5), &mut cancel, move |_| base);
+    fn matches_crossing_the_window_are_clipped_not_dropped() {
+        // The whole context matches; the window keeps positions 2..6.
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
         assert_eq!(
-            sort_seeds(&mut seeds, &mut stopper),
-            Err(PlanErrorKind::Cancelled)
-        );
-    }
-
-    #[test]
-    fn odd_positions_are_not_filtered_by_physical_parity() {
-        let ranges = discover_ranges(&[9, 1, 2, 3], &[8, 9, 1, 2, 3], 3);
-        assert_eq!(
-            ranges,
-            vec![CandidateRange {
-                source_start: 0,
-                destination_start: 1,
-                token_count: 4,
-            }]
+            discover_in(&tokens, &tokens, 2..6, 3),
+            BTreeSet::from([(2, 2, 4)])
         );
     }
 }

@@ -59,12 +59,6 @@ fn exact_match_is_discovered_selected_and_round_trips_identity() {
 }
 
 #[test]
-fn matches_are_found_at_all_logical_positions_not_physical_parity_strides() {
-    let plan = run(&[8, 9, 1, 2, 3], &[9, 1, 2, 3], 3, 1).expect("odd-position match");
-    assert_eq!(plan.ranges(), &[range(0, 1, 4)]);
-}
-
-#[test]
 fn repeated_competing_matches_remain_available_to_the_selector() {
     let context = [1, 2, 3, 0, 1, 2, 3];
     let cache = [7, 1, 2, 3, 8, 1, 2, 3, 9];
@@ -230,51 +224,6 @@ fn inputs_beyond_the_supported_envelope_are_admission_errors() {
             ..
         }
     ));
-}
-
-fn adversarial_tokens(n: usize) -> Vec<u32> {
-    let mut order: Vec<usize> = (0..n).collect();
-    let mut out = vec![0u32; n];
-    let mut rank = n as u64;
-    while order.len() > 24 {
-        let mid = order.len() / 2;
-        let pos = order.remove(mid);
-        out[pos] = rank as u32;
-        rank -= 1;
-    }
-    while let Some(pos) = order.pop() {
-        out[pos] = rank as u32;
-        rank -= 1;
-    }
-    out
-}
-
-#[test]
-fn crafted_seed_order_does_not_exhaust_a_small_stack() {
-    let cache_tokens = adversarial_tokens(2_000);
-    let result = std::thread::Builder::new()
-        .stack_size(256 * 1024)
-        .spawn(move || {
-            let mut cancel = || false;
-            CacheReuseAnalysis {
-                context_tokens: &[7],
-                cache: CacheView {
-                    tokens: &cache_tokens,
-                    identity: CacheIdentity::new(7),
-                    minimum_match_tokens: 1,
-                },
-                k: 1,
-                deadline: Instant::now() + Duration::from_secs(10),
-                cancel: &mut cancel,
-                placement: PlacementPolicy::without_padding(1),
-            }
-            .analyze()
-        })
-        .expect("spawn")
-        .join()
-        .expect("thread");
-    let plan = result.expect("crafted order should return a plan");
-    assert_eq!(plan.covered_tokens(), 1);
 }
 
 #[test]

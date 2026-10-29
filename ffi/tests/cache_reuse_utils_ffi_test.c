@@ -25,6 +25,7 @@ static cache_reuse_config config_for(uint32_t k) {
     c.allow_all_insertions = false;
     c.allowed_insertions = NULL;
     c.allowed_insertion_count = 0;
+    c.pad_penalty_tokens = 0; /* default 16 when padding is enabled */
     return c;
 }
 
