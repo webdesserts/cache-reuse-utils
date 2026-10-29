@@ -68,6 +68,17 @@ fn repeated_competing_matches_remain_available_to_the_selector() {
 }
 
 #[test]
+fn discovery_overlap_stats_count_matches_before_placement() {
+    let context = [1, 2, 3, 4, 0, 1, 2, 3];
+    let cache = [1, 2, 3, 4, 9, 1, 2, 3];
+    let plan = run(&context, &cache, 3, 1).expect("plan");
+    // Each 1-2-3 run matches both cached runs; only one range is selected.
+    assert_eq!(plan.ranges(), &[range(0, 0, 4)]);
+    assert_eq!(plan.discovered_match_count(), 4);
+    assert_eq!(plan.longest_match_tokens(), 4);
+}
+
+#[test]
 fn minimum_filters_short_runs_and_handles_no_matches() {
     // A run shorter than the minimum is filtered after actual discovery.
     // With nothing to place, search is complete; `NoFeasibleReuse` is kept
@@ -83,6 +94,13 @@ fn minimum_filters_short_runs_and_handles_no_matches() {
     assert_eq!(too_long.discovery_status(), DiscoveryStatus::Complete);
     assert!(too_long.timing().discovery().is_none());
     assert!(too_long.timing().search().is_none());
+    assert_eq!(
+        (
+            too_long.discovered_match_count(),
+            too_long.longest_match_tokens()
+        ),
+        (0, 0)
+    );
 
     let actual_none = run(&[1, 2, 3], &[4, 5, 6], 2, 1).expect("complete no match");
     assert!(actual_none.ranges().is_empty());
@@ -90,6 +108,13 @@ fn minimum_filters_short_runs_and_handles_no_matches() {
     assert_eq!(actual_none.discovery_status(), DiscoveryStatus::Complete);
     assert!(actual_none.timing().discovery().is_some());
     assert!(actual_none.timing().search().is_none());
+    assert_eq!(
+        (
+            actual_none.discovered_match_count(),
+            actual_none.longest_match_tokens()
+        ),
+        (0, 0)
+    );
     assert_eq!(
         actual_none.timing().elapsed(),
         actual_none.timing().preparation() + actual_none.timing().discovery().unwrap()
@@ -197,6 +222,8 @@ fn candidate_capacity_retains_verified_matches_and_reports_partial_discovery() {
         DiscoveryStatus::CandidateLimitReached
     );
     assert_eq!(plan.covered_tokens(), 1);
+    assert_eq!(plan.discovered_match_count(), 4096);
+    assert_eq!(plan.longest_match_tokens(), 1);
 }
 
 #[test]

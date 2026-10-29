@@ -1,7 +1,7 @@
 //! The plan returned by a successful analysis.
 
 use crate::cache_view::CacheIdentity;
-use crate::discovery::DiscoveryStatus;
+use crate::discovery::{DiscoveryStatus, DiscoverySummary};
 use crate::placement::{
     PlacedRange, PlacementMetrics, PlacementPolicy, PlacementRecipe, PlacementStatus,
 };
@@ -17,7 +17,7 @@ pub struct ReusePlan {
     placement: PlacementRecipe,
     metrics: PlacementMetrics,
     placement_status: PlacementStatus,
-    discovery_status: DiscoveryStatus,
+    discovery: DiscoverySummary,
     timing: AnalysisTiming,
 }
 
@@ -27,7 +27,7 @@ impl ReusePlan {
     pub(crate) fn from_outcome(
         context_len: usize,
         cache_identity: CacheIdentity,
-        discovery_status: DiscoveryStatus,
+        discovery: DiscoverySummary,
         outcome: PlacementOutcome,
         policy: &PlacementPolicy<'_>,
         timing: AnalysisTiming,
@@ -55,7 +55,7 @@ impl ReusePlan {
             placement,
             metrics,
             placement_status: outcome.status,
-            discovery_status,
+            discovery,
             timing,
         })
     }
@@ -84,7 +84,25 @@ impl ReusePlan {
 
     /// Whether discovery was complete or stopped at the candidate capacity.
     pub fn discovery_status(&self) -> DiscoveryStatus {
-        self.discovery_status
+        self.discovery.status
+    }
+
+    /// Number of candidate matches discovery handed to placement search,
+    /// at most 4,096. Zero when discovery did not run or found no match.
+    ///
+    /// This is raw overlap telemetry: it counts matches before placement,
+    /// including ones the selected plan does not use.
+    pub fn discovered_match_count(&self) -> u32 {
+        self.discovery.match_count
+    }
+
+    /// Token length of the longest discovered match, or 0 without one.
+    ///
+    /// Matches are clipped to the window between the protected prefix and
+    /// fresh suffix, so this can exceed the plan's covered tokens but never
+    /// that window.
+    pub fn longest_match_tokens(&self) -> u32 {
+        self.discovery.longest_match_tokens
     }
 
     /// The prepared-target recipe: reused ranges and this call's insertions.

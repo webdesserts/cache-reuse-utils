@@ -2,7 +2,7 @@
 
 use cache_reuse_utils::{
     AllowedInsertions, CacheIdentity, CacheReuseAnalysis, CacheView, LossAllowance,
-    PlacementPolicy, ReusePlan,
+    PlacementPolicy, ReusePlan, logical_boundary, project_to_logical,
 };
 use std::time::{Duration, Instant};
 
@@ -260,6 +260,28 @@ fn padded_plans_materialize_and_honor_the_policy() {
             "case {case}"
         );
         assert!(recipe.prepared_tokens as usize <= context.len() + spare);
+        let mut into = vec![0; prepared.len()];
+        let mut pads = vec![0; (recipe.prepared_tokens - recipe.original_tokens) as usize];
+        recipe
+            .materialize_into(&context, &cache, &mut into, Some(&mut pads))
+            .unwrap();
+        assert_eq!(into, prepared, "case {case}");
+        let mut logical = vec![0; context.len()];
+        assert_eq!(
+            project_to_logical(&prepared, &pads, &mut logical),
+            Some(context.len() as u32)
+        );
+        assert_eq!(logical, context, "case {case}");
+        for index in 0..=context.len() as u32 {
+            let position = recipe.prepared_position(index).unwrap();
+            for physical in [position.before_insertions, position.after_insertions] {
+                assert_eq!(
+                    logical_boundary(physical, recipe.prepared_tokens, &pads),
+                    Some(index),
+                    "case {case}"
+                );
+            }
+        }
         for range in &recipe.ranges {
             assert_eq!(
                 range.prepared_start % policy.prepared_target_start_alignment,

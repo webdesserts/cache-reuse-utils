@@ -106,15 +106,36 @@ covered_tokens
 The penalties only choose between plans inside the allowance. With a zero
 allowance, the plan with the most coverage is required whatever its cost.
 
-`PlacementRecipe::materialize` constructs the prepared token buffer and verifies
-that every reused span matches the original target tokens; it never touches
-native engine state.
+`PlacementRecipe::materialize` builds the prepared token sequence and verifies
+that every reused span matches the original target tokens without touching
+native engine state. `PlacementRecipe::materialize_into` writes the prepared
+tokens (and, optionally, the physical index of every inserted pad) directly
+into caller-supplied slices without allocating. Each `Insertion` carries both
+its original boundary (`before_target_index`) and its physical start index
+(`prepared_start`), matching `PlacedRange`.
+
+`ReusePlan::discovered_match_count` and `ReusePlan::longest_match_tokens`
+report raw discovery overlap before placement so callers can record overlap
+telemetry without a separate pass.
+
+### Physical and logical coordinates
+
+When padding is inserted, an engine's KV cache holds a **physical** sequence
+(the logical prompt tokens interleaved with pad tokens). Given a strictly
+increasing slice of physical `pad_positions` (as written by
+`materialize_into`), the stateless helpers `validate_pad_positions`,
+`project_to_logical`, `logical_boundary`, and `common_logical_prefix` convert
+between physical and logical coordinates. Pads are identified strictly by
+position—never by token value—so ordinary prompt tokens that happen to share the
+pad token ID are preserved intact.
 
 ## C ABI
 
 The `ffi/` crate provides a model-independent C ABI boundary. It builds the
-`cache_reuse_utils_ffi` static library, which exports `cache_reuse_plan` along
-with the `cache_reuse_*` structs and `CACHE_REUSE_*` constants declared in the
+`cache_reuse_utils_ffi` static library, which exports `cache_reuse_plan`,
+`cache_reuse_materialize` and the coordinate helpers
+(`cache_reuse_project_logical`, `cache_reuse_logical_boundary`,
+`cache_reuse_common_prefix`) along with the `cache_reuse_*` structs and `CACHE_REUSE_*` constants declared in the
 checked-in header `ffi/include/cache_reuse_utils.h`. Ordinary Rust and C builds
 do not require `cbindgen`.
 
@@ -166,7 +187,13 @@ a downstream Rust crate links `cache-reuse-utils-ffi` and relies on its
 - Setting `range_penalty_tokens = 0` selects the default range penalty (`32`).
   Use `1` for the smallest penalty.
 - `max_ranges` accepts `1..=CACHE_REUSE_MAX_RANGES` (32). The result holds up
-  to 32 ranges and 32 insertions, about 1 KiB, so it still fits on the stack.
+  to 32 ranges and 32 insertions, about 1.1 KiB, so it still fits on the stack.
+- `cache_reuse_materialize` rebuilds the recipe from a successful `result` and
+  writes the prepared tokens (and, optionally, pad positions) into caller
+  buffers of exactly `result->prepared_tokens` (and `result->inserted_padding`)
+  elements. It and the coordinate helpers return `CACHE_REUSE_COMPLETE`,
+  `CACHE_REUSE_ERR_INVALID` or `CACHE_REUSE_ERR_PANIC`, and borrow token
+  buffers without copying; buffers passed to one call must not overlap.
 
 To verify that `ffi/include/cache_reuse_utils.h` matches the Rust definitions
 (requires `cbindgen` 0.29.4; writes to a temporary file without touching the

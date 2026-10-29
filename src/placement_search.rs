@@ -560,14 +560,17 @@ impl Search<'_> {
         }
         let mut plan: Vec<PlacedRange> = Vec::new();
         let mut insertions = Vec::new();
+        let mut inserted = 0u32;
         for label in steps.into_iter().rev() {
             let (boundary, count) = label.insertion;
             if count > 0 {
                 insertions.push(Insertion {
                     before_target_index: boundary,
+                    prepared_start: boundary + inserted,
                     token: self.policy.pad_token.unwrap_or_default(),
                     count,
                 });
+                inserted += count;
             }
             match plan.last_mut() {
                 Some(last) if label.merged => last.token_count += label.piece.token_count,

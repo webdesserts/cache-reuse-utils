@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::cache_view::CacheView;
 use crate::candidate::MAX_RANGES;
-use crate::discovery::{DiscoveryStatus, MAX_DISCOVERY_TOKENS, discover};
+use crate::discovery::{DiscoverySummary, MAX_DISCOVERY_TOKENS, discover};
 use crate::error::{AdmissionDeniedReason, ContractError, InputSide, PlanError, PlanErrorKind};
 use crate::placement::PlacementPolicy;
 use crate::placement_search::{PlacementOutcome, search};
@@ -83,7 +83,7 @@ fn run(
         return finish(
             context,
             &cache,
-            DiscoveryStatus::Complete,
+            DiscoverySummary::NONE,
             empty(),
             policy,
             stopper,
@@ -98,7 +98,14 @@ fn run(
         discover(context, window, cache, stopper).map_err(|stop| fail(stopper, stop))?;
     if discovery.ranges.is_empty() {
         stopper.check().map_err(|stop| fail(stopper, stop))?;
-        return finish(context, &cache, discovery.status, empty(), policy, stopper);
+        return finish(
+            context,
+            &cache,
+            discovery.summary(),
+            empty(),
+            policy,
+            stopper,
+        );
     }
 
     // A refusal here reports stage Search with no search duration.
@@ -107,7 +114,14 @@ fn run(
     stopper.start_search();
     let outcome = search(context.len(), &discovery.ranges, k, policy, stopper)
         .map_err(|error| fail(stopper, error))?;
-    finish(context, &cache, discovery.status, outcome, policy, stopper)
+    finish(
+        context,
+        &cache,
+        discovery.summary(),
+        outcome,
+        policy,
+        stopper,
+    )
 }
 
 fn validate(
@@ -161,7 +175,7 @@ fn empty() -> PlacementOutcome {
 fn finish(
     context: &[u32],
     cache: &CacheView<'_>,
-    discovery_status: DiscoveryStatus,
+    discovery: DiscoverySummary,
     outcome: PlacementOutcome,
     policy: &PlacementPolicy<'_>,
     stopper: &mut Stopper<'_>,
@@ -179,7 +193,7 @@ fn finish(
     ReusePlan::from_outcome(
         context.len(),
         cache.identity,
-        discovery_status,
+        discovery,
         outcome,
         policy,
         timing,

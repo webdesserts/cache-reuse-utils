@@ -83,6 +83,19 @@ Feature: Full cache-reuse analysis
     When cancellation is observed at any stage, even after a plan was found or the deadline passed
     Then analysis returns a Cancelled error and discards any partial plan
 
+  Scenario: Slice materialization populates prepared tokens and physical pad positions without allocating
+    Given a selected reuse plan that inserts padding before one or more reused ranges
+    When the caller materializes the recipe into pre-allocated prepared-token and pad-position slices
+    Then each Insertion's prepared_start equals its original target boundary plus all earlier insertions
+    And every reused range matches the corresponding source and target tokens
+    And projecting the prepared tokens with those pad positions recovers the exact original target tokens
+
+  Scenario: Common logical prefix skips interleaved pads in a cached physical sequence
+    Given a cached physical token sequence and its strictly increasing pad positions
+    When a new logical prompt is compared with common_logical_prefix
+    Then the helper reports the number of matching leading logical tokens and the pads carried inside that prefix
+    And any pad positions after the last matching logical token are excluded from the kept physical prefix
+
   Scenario: Invalid requests are rejected during preparation
     Given K outside 1..=32, a zero minimum match length, an invalid placement policy, or an oversized input
     When analysis runs

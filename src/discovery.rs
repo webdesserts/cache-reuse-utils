@@ -28,6 +28,40 @@ pub(crate) struct DiscoveryOutcome {
     pub status: DiscoveryStatus,
 }
 
+/// Discovery overlap statistics carried into the plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiscoverySummary {
+    pub status: DiscoveryStatus,
+    /// Retained candidate matches handed to placement search.
+    pub match_count: u32,
+    /// Token length of the longest retained match, or 0 without one.
+    pub longest_match_tokens: u32,
+}
+
+impl DiscoverySummary {
+    /// The summary when discovery did not run or found nothing.
+    pub(crate) const NONE: Self = Self {
+        status: DiscoveryStatus::Complete,
+        match_count: 0,
+        longest_match_tokens: 0,
+    };
+}
+
+impl DiscoveryOutcome {
+    pub(crate) fn summary(&self) -> DiscoverySummary {
+        DiscoverySummary {
+            status: self.status,
+            match_count: self.ranges.len() as u32,
+            longest_match_tokens: self
+                .ranges
+                .iter()
+                .map(|range| range.token_count)
+                .max()
+                .unwrap_or(0),
+        }
+    }
+}
+
 fn window_hash(tokens: &[u32], start: usize, minimum: usize) -> u64 {
     tokens[start..start + minimum]
         .iter()

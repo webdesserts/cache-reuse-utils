@@ -357,6 +357,9 @@ impl PlacedRange {
 pub struct Insertion {
     /// Original-target boundary before which the tokens are inserted.
     pub before_target_index: u32,
+    /// First prepared-target index of this insertion run after earlier
+    /// insertions: `before_target_index` plus all earlier insertion counts.
+    pub prepared_start: u32,
     /// Model-visible token value inserted.
     pub token: u32,
     /// Number of tokens inserted at this boundary.
@@ -424,14 +427,22 @@ impl PlacementRecipe {
             return Err(PlacementMaterializeError::RecipeShape);
         }
         let mut previous_insertion = None;
+        let mut prior_inserted = 0u64;
         for insertion in &self.insertions {
             if insertion.count == 0
                 || insertion.before_target_index > self.original_tokens
                 || previous_insertion.is_some_and(|value| value >= insertion.before_target_index)
+                || insertion.prepared_start as u64
+                    != insertion.before_target_index as u64 + prior_inserted
+                || insertion
+                    .prepared_start
+                    .checked_add(insertion.count)
+                    .is_none_or(|end| end > self.prepared_tokens)
             {
                 return Err(PlacementMaterializeError::RecipeShape);
             }
             previous_insertion = Some(insertion.before_target_index);
+            prior_inserted += insertion.count as u64;
         }
         let mut previous_end: Option<(u32, u32, u32)> = None;
         for range in &self.ranges {
@@ -489,10 +500,9 @@ impl PlacementRecipe {
 
     /// Build the prepared target token buffer.
     ///
-    /// Walks the original `context`, inserts this recipe's pads at their
-    /// boundaries and copies reused spans from `source`. Every reused token
-    /// must equal the context token it replaces. This builds tokens only; it
-    /// does not touch native cache state.
+    /// Allocates exactly `prepared_tokens` tokens and fills them with
+    /// [`Self::materialize_into`]. This builds tokens only; it does not touch
+    /// native cache state.
     ///
     /// ```
     /// # use cache_reuse_utils::{CacheIdentity, Insertion, PlacedRange, PlacementRecipe};
@@ -508,6 +518,7 @@ impl PlacementRecipe {
     ///     }],
     ///     insertions: vec![Insertion {
     ///         before_target_index: 1,
+    ///         prepared_start: 1,
     ///         token: 9,
     ///         count: 1,
     ///     }],
@@ -527,75 +538,123 @@ impl PlacementRecipe {
         let mut out = Vec::new();
         out.try_reserve_exact(self.prepared_tokens as usize)
             .map_err(|_| PlacementMaterializeError::Allocation)?;
-        let mut insert_index = 0usize;
-        let mut range_index = 0usize;
-        let mut index = 0usize;
-        while index < context.len() {
-            while insert_index < self.insertions.len()
-                && self.insertions[insert_index].before_target_index as usize == index
-            {
-                let insertion = self.insertions[insert_index];
-                let remaining = (self.prepared_tokens as usize)
-                    .checked_sub(out.len())
-                    .ok_or(PlacementMaterializeError::RecipeShape)?;
-                if insertion.count as usize > remaining {
-                    return Err(PlacementMaterializeError::RecipeShape);
-                }
-                for _ in 0..insertion.count {
-                    out.push(insertion.token);
-                }
-                insert_index += 1;
-            }
-            if let Some(range) = self.ranges.get(range_index).copied() {
-                if (range.destination_start as usize) < index {
-                    return Err(PlacementMaterializeError::RecipeShape);
-                }
-                if range.destination_start as usize == index {
-                    if out.len() != range.prepared_start as usize {
-                        return Err(PlacementMaterializeError::RecipeShape);
-                    }
-                    for offset in 0..range.token_count as usize {
-                        let target_index = index + offset;
-                        let value = *source
-                            .get(range.source_start as usize + offset)
-                            .ok_or(PlacementMaterializeError::SourceRange)?;
-                        if target_index >= context.len() || value != context[target_index] {
-                            return Err(PlacementMaterializeError::ContentMismatch {
-                                index: target_index,
-                            });
-                        }
-                        out.push(value);
-                    }
-                    index += range.token_count as usize;
-                    range_index += 1;
-                    continue;
-                }
-            }
-            out.push(context[index]);
-            index += 1;
-        }
-        while insert_index < self.insertions.len()
-            && self.insertions[insert_index].before_target_index as usize == context.len()
-        {
-            let insertion = self.insertions[insert_index];
-            let remaining = (self.prepared_tokens as usize)
-                .checked_sub(out.len())
-                .ok_or(PlacementMaterializeError::RecipeShape)?;
-            if insertion.count as usize > remaining {
-                return Err(PlacementMaterializeError::RecipeShape);
-            }
-            for _ in 0..insertion.count {
-                out.push(insertion.token);
-            }
-            insert_index += 1;
-        }
-        if out.len() != self.prepared_tokens as usize
-            || range_index != self.ranges.len()
-            || insert_index != self.insertions.len()
-        {
-            return Err(PlacementMaterializeError::RecipeShape);
-        }
+        out.resize(self.prepared_tokens as usize, 0);
+        self.materialize_into(context, source, &mut out, None)?;
         Ok(out)
+    }
+
+    /// Write the prepared target into caller-owned buffers without allocating.
+    ///
+    /// Walks the original `context`, writes this recipe's pads at their
+    /// boundaries and copies reused spans from `source`. Every reused token
+    /// must equal the context token it replaces.
+    ///
+    /// `out_prepared` must hold exactly `prepared_tokens` tokens. When
+    /// `out_pad_positions` is given it must hold exactly
+    /// `prepared_tokens - original_tokens` entries and receives the prepared
+    /// index of every inserted pad, in increasing order. A wrong length is
+    /// [`PlacementMaterializeError::InputShape`]. On any error the output
+    /// buffers may be partially written and must not be used.
+    ///
+    /// ```
+    /// # use cache_reuse_utils::{CacheIdentity, Insertion, PlacedRange, PlacementRecipe};
+    /// let recipe = PlacementRecipe {
+    ///     cache_identity: CacheIdentity::new(1),
+    ///     original_tokens: 3,
+    ///     prepared_tokens: 5,
+    ///     ranges: vec![PlacedRange {
+    ///         source_start: 0,
+    ///         destination_start: 1,
+    ///         token_count: 2,
+    ///         prepared_start: 3,
+    ///     }],
+    ///     insertions: vec![Insertion {
+    ///         before_target_index: 1,
+    ///         prepared_start: 1,
+    ///         token: 9,
+    ///         count: 2,
+    ///     }],
+    /// };
+    /// let mut prepared = [0; 5];
+    /// let mut pads = [0; 2];
+    /// recipe
+    ///     .materialize_into(&[0, 1, 2], &[1, 2], &mut prepared, Some(&mut pads))
+    ///     .unwrap();
+    /// assert_eq!(prepared, [0, 9, 9, 1, 2]);
+    /// assert_eq!(pads, [1, 2]);
+    /// ```
+    pub fn materialize_into(
+        &self,
+        context: &[u32],
+        source: &[u32],
+        out_prepared: &mut [u32],
+        mut out_pad_positions: Option<&mut [u32]>,
+    ) -> Result<(), PlacementMaterializeError> {
+        use PlacementMaterializeError::{ContentMismatch, InputShape, RecipeShape, SourceRange};
+        self.validate()?;
+        let pad_total = (self.prepared_tokens - self.original_tokens) as usize;
+        if context.len() != self.original_tokens as usize
+            || out_prepared.len() != self.prepared_tokens as usize
+            || out_pad_positions
+                .as_ref()
+                .is_some_and(|pads| pads.len() != pad_total)
+        {
+            return Err(InputShape);
+        }
+        let mut insertions = self.insertions.iter().peekable();
+        let mut ranges = self.ranges.iter().peekable();
+        let mut pos = 0usize;
+        let mut pad_index = 0usize;
+        let mut index = 0usize;
+        loop {
+            while let Some(insertion) =
+                insertions.next_if(|insertion| insertion.before_target_index as usize == index)
+            {
+                for _ in 0..insertion.count {
+                    *out_prepared.get_mut(pos).ok_or(RecipeShape)? = insertion.token;
+                    if let Some(pads) = out_pad_positions.as_deref_mut() {
+                        *pads.get_mut(pad_index).ok_or(RecipeShape)? = pos as u32;
+                    }
+                    pos += 1;
+                    pad_index += 1;
+                }
+            }
+            if index == context.len() {
+                break;
+            }
+            if let Some(range) = ranges.next_if(|range| range.destination_start as usize == index) {
+                if pos != range.prepared_start as usize {
+                    return Err(RecipeShape);
+                }
+                for offset in 0..range.token_count as usize {
+                    let target_index = index + offset;
+                    let expected = *context.get(target_index).ok_or(RecipeShape)?;
+                    let value = *source
+                        .get(range.source_start as usize + offset)
+                        .ok_or(SourceRange)?;
+                    if value != expected {
+                        return Err(ContentMismatch {
+                            index: target_index,
+                        });
+                    }
+                    *out_prepared.get_mut(pos).ok_or(RecipeShape)? = value;
+                    pos += 1;
+                }
+                index += range.token_count as usize;
+            } else {
+                *out_prepared.get_mut(pos).ok_or(RecipeShape)? = context[index];
+                pos += 1;
+                index += 1;
+            }
+        }
+        if pos != out_prepared.len()
+            || pad_index != pad_total
+            || ranges.next().is_some()
+            || insertions.next().is_some()
+        {
+            return Err(RecipeShape);
+        }
+        Ok(())
     }
 }
 
@@ -678,6 +737,7 @@ mod tests {
             }],
             insertions: vec![Insertion {
                 before_target_index: 1,
+                prepared_start: 1,
                 token: 9,
                 count: 1,
             }],
@@ -711,11 +771,13 @@ mod tests {
             insertions: vec![
                 Insertion {
                     before_target_index: 0,
+                    prepared_start: 0,
                     token: 1,
                     count: u32::MAX,
                 },
                 Insertion {
                     before_target_index: 1,
+                    prepared_start: 1,
                     token: 2,
                     count: u32::MAX,
                 },

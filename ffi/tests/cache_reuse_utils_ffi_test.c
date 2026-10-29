@@ -112,6 +112,52 @@ int main(void) {
         fprintf(stderr, "authorized insertion recipe test failed\n");
         return 1;
     }
+    if (r.insertions[0].prepared_start != 0 || r.discovered_match_count != 1 ||
+        r.longest_match_tokens != 4) {
+        fprintf(stderr, "insertion prepared start or discovery stats wrong\n");
+        return 1;
+    }
+    {
+        int32_t prepared[7];
+        uint32_t pads[1];
+        char err[128] = {0};
+        uint32_t st = cache_reuse_materialize(insert_target, 6, insert_source, 4, &r, prepared, 7,
+                                              pads, 1, err, sizeof(err));
+        const int32_t expected[7] = {77, 1, 2, 3, 4, 5, 9};
+        if (st != CACHE_REUSE_COMPLETE || memcmp(prepared, expected, sizeof(expected)) != 0 ||
+            pads[0] != 0) {
+            fprintf(stderr, "materialize failed: %u %s\n", st, err);
+            return 1;
+        }
+        if (cache_reuse_materialize(insert_target, 6, insert_source, 4, &r, prepared, 6, NULL, 0,
+                                    err, sizeof(err)) != CACHE_REUSE_ERR_INVALID) {
+            fprintf(stderr, "materialize accepted a short output\n");
+            return 1;
+        }
+        int32_t logical[6];
+        uint32_t logical_len = 0;
+        if (cache_reuse_project_logical(prepared, 7, pads, 1, logical, 6, &logical_len, err,
+                                        sizeof(err)) != CACHE_REUSE_COMPLETE ||
+            logical_len != 6 || memcmp(logical, insert_target, sizeof(logical)) != 0) {
+            fprintf(stderr, "projection did not recover the target\n");
+            return 1;
+        }
+        uint32_t boundary = 0;
+        if (cache_reuse_logical_boundary(3, 7, pads, 1, &boundary, err, sizeof(err)) !=
+                CACHE_REUSE_COMPLETE || boundary != 2) {
+            fprintf(stderr, "logical boundary wrong: %u\n", boundary);
+            return 1;
+        }
+        cache_reuse_common_prefix_result prefix;
+        int32_t next[3] = {1, 2, 8};
+        if (cache_reuse_common_prefix(next, 3, prepared, 7, pads, 1, &prefix, err, sizeof(err)) !=
+                CACHE_REUSE_COMPLETE || prefix.common_logical_tokens != 2 ||
+            prefix.carried_pads != 1 || prefix.physical_prefix_tokens != 3 ||
+            prefix.live_logical_tokens != 6) {
+            fprintf(stderr, "common prefix wrong\n");
+            return 1;
+        }
+    }
     cfg = config_for(1);
     cfg.minimum_match_tokens = 4;
     cfg.max_prepared_tokens = 7;

@@ -2,8 +2,9 @@ use cache_reuse_utils_ffi::{
     CACHE_REUSE_COMPLETE, CACHE_REUSE_DEADLINE_PARTIAL, CACHE_REUSE_ERR_ADMISSION,
     CACHE_REUSE_ERR_BUDGET, CACHE_REUSE_ERR_CANCELLED, CACHE_REUSE_ERR_INVALID,
     CACHE_REUSE_ERR_PANIC, CACHE_REUSE_MAX_INSERTIONS, CACHE_REUSE_MAX_RANGES,
-    CACHE_REUSE_NO_FEASIBLE, CACHE_REUSE_STATE_LIMIT, CACHE_REUSE_VARIANT_LIMIT, CacheReuseConfig,
-    CacheReuseInsertion, CacheReuseRange, CacheReuseResult,
+    CACHE_REUSE_NO_FEASIBLE, CACHE_REUSE_STATE_LIMIT, CACHE_REUSE_VARIANT_LIMIT,
+    CacheReuseCommonPrefix, CacheReuseConfig, CacheReuseInsertion, CacheReuseRange,
+    CacheReuseResult,
 };
 use std::mem::{align_of, offset_of, size_of};
 
@@ -18,11 +19,12 @@ fn c_abi_layout_matches_expected_darwin_arm64_shape() {
     assert_eq!(offset_of!(CacheReuseRange, count), 8);
     assert_eq!(offset_of!(CacheReuseRange, prepared_start), 12);
 
-    assert_eq!(size_of::<CacheReuseInsertion>(), 12);
+    assert_eq!(size_of::<CacheReuseInsertion>(), 16);
     assert_eq!(align_of::<CacheReuseInsertion>(), 4);
     assert_eq!(offset_of!(CacheReuseInsertion, before_target_index), 0);
-    assert_eq!(offset_of!(CacheReuseInsertion, token), 4);
-    assert_eq!(offset_of!(CacheReuseInsertion, count), 8);
+    assert_eq!(offset_of!(CacheReuseInsertion, prepared_start), 4);
+    assert_eq!(offset_of!(CacheReuseInsertion, token), 8);
+    assert_eq!(offset_of!(CacheReuseInsertion, count), 12);
 
     assert_eq!(size_of::<CacheReuseConfig>(), 96);
     assert_eq!(align_of::<CacheReuseConfig>(), 8);
@@ -58,7 +60,7 @@ fn c_abi_layout_matches_expected_darwin_arm64_shape() {
     assert_eq!(offset_of!(CacheReuseConfig, pad_penalty_tokens), 84);
     assert_eq!(offset_of!(CacheReuseConfig, range_penalty_tokens), 88);
 
-    assert_eq!(size_of::<CacheReuseResult>(), 968);
+    assert_eq!(size_of::<CacheReuseResult>(), 1104);
     assert_eq!(align_of::<CacheReuseResult>(), 8);
     assert_eq!(offset_of!(CacheReuseResult, status), 0);
     assert_eq!(offset_of!(CacheReuseResult, covered_tokens), 4);
@@ -68,22 +70,34 @@ fn c_abi_layout_matches_expected_darwin_arm64_shape() {
     assert_eq!(offset_of!(CacheReuseResult, admissible_min), 20);
     assert_eq!(offset_of!(CacheReuseResult, range_count), 24);
     assert_eq!(offset_of!(CacheReuseResult, insertion_count), 28);
-    assert_eq!(offset_of!(CacheReuseResult, elapsed_ns), 32);
-    assert_eq!(offset_of!(CacheReuseResult, preparation_ns), 40);
-    assert_eq!(offset_of!(CacheReuseResult, discovery_ns), 48);
-    assert_eq!(offset_of!(CacheReuseResult, search_ns), 56);
-    assert_eq!(offset_of!(CacheReuseResult, discovery_entered), 64);
-    assert_eq!(offset_of!(CacheReuseResult, search_entered), 65);
-    assert_eq!(offset_of!(CacheReuseResult, timing_known), 66);
-    assert_eq!(offset_of!(CacheReuseResult, ranges), 68);
-    assert_eq!(offset_of!(CacheReuseResult, insertions), 580);
+    assert_eq!(offset_of!(CacheReuseResult, discovered_match_count), 32);
+    assert_eq!(offset_of!(CacheReuseResult, longest_match_tokens), 36);
+    assert_eq!(offset_of!(CacheReuseResult, elapsed_ns), 40);
+    assert_eq!(offset_of!(CacheReuseResult, preparation_ns), 48);
+    assert_eq!(offset_of!(CacheReuseResult, discovery_ns), 56);
+    assert_eq!(offset_of!(CacheReuseResult, search_ns), 64);
+    assert_eq!(offset_of!(CacheReuseResult, discovery_entered), 72);
+    assert_eq!(offset_of!(CacheReuseResult, search_entered), 73);
+    assert_eq!(offset_of!(CacheReuseResult, timing_known), 74);
+    assert_eq!(offset_of!(CacheReuseResult, ranges), 76);
+    assert_eq!(offset_of!(CacheReuseResult, insertions), 588);
+
+    assert_eq!(size_of::<CacheReuseCommonPrefix>(), 16);
+    assert_eq!(align_of::<CacheReuseCommonPrefix>(), 4);
+    assert_eq!(offset_of!(CacheReuseCommonPrefix, common_logical_tokens), 0);
+    assert_eq!(
+        offset_of!(CacheReuseCommonPrefix, physical_prefix_tokens),
+        4
+    );
+    assert_eq!(offset_of!(CacheReuseCommonPrefix, carried_pads), 8);
+    assert_eq!(offset_of!(CacheReuseCommonPrefix, live_logical_tokens), 12);
 
     assert_eq!(CACHE_REUSE_MAX_RANGES, 32);
     assert_eq!(CACHE_REUSE_MAX_INSERTIONS, 32);
     assert_eq!(size_of::<[CacheReuseRange; CACHE_REUSE_MAX_RANGES]>(), 512);
     assert_eq!(
         size_of::<[CacheReuseInsertion; CACHE_REUSE_MAX_INSERTIONS]>(),
-        384
+        512
     );
     assert_eq!(CACHE_REUSE_COMPLETE, 0);
     assert_eq!(CACHE_REUSE_NO_FEASIBLE, 1);

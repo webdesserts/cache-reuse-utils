@@ -3,6 +3,9 @@
 //! This crate is the separate authorized C ABI boundary. It owns pointer
 //! handling, input copying, panic containment and bounded result serialization;
 //! the core crate remains std-only and unsafe-free.
+//!
+//! Every exported function contains panics and retains no pointer after it
+//! returns. Input and output buffers passed to one call must not overlap.
 
 use std::ffi::{c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -11,8 +14,9 @@ use std::time::{Duration, Instant};
 
 use cache_reuse_utils::{
     AllowedInsertions, AnalysisTiming, CacheIdentity, CacheReuseAnalysis, CacheView,
-    DEFAULT_PAD_PENALTY_TOKENS, DEFAULT_RANGE_PENALTY_TOKENS, LossAllowance, PlacementPolicy,
-    PlacementStatus, PlanError, PlanErrorKind,
+    DEFAULT_PAD_PENALTY_TOKENS, DEFAULT_RANGE_PENALTY_TOKENS, Insertion, LossAllowance,
+    PlacedRange, PlacementMaterializeError, PlacementPolicy, PlacementRecipe, PlacementStatus,
+    PlanError, PlanErrorKind,
 };
 
 pub const CACHE_REUSE_COMPLETE: u32 = 0;
@@ -46,6 +50,9 @@ pub struct CacheReuseRange {
 #[derive(Clone, Copy, Default)]
 pub struct CacheReuseInsertion {
     pub before_target_index: u32,
+    /// First prepared-target index of this run: `before_target_index` plus
+    /// all earlier insertion counts.
+    pub prepared_start: u32,
     pub token: u32,
     pub count: u32,
 }
@@ -93,6 +100,11 @@ pub struct CacheReuseResult {
     pub admissible_min: u32,
     pub range_count: u32,
     pub insertion_count: u32,
+    /// Candidate matches discovery handed to placement search, before
+    /// placement. 0 when discovery did not run or found nothing.
+    pub discovered_match_count: u32,
+    /// Token length of the longest discovered match, or 0 without one.
+    pub longest_match_tokens: u32,
     pub elapsed_ns: u64,
     pub preparation_ns: u64,
     pub discovery_ns: u64,
@@ -243,6 +255,8 @@ fn apply_result(result: &mut CacheReuseResult, plan: cache_reuse_utils::ReusePla
     result.admissible_min = u32::try_from(metrics.admissible_min).unwrap_or(u32::MAX);
     result.range_count = ranges.len() as u32;
     result.insertion_count = insertions.len() as u32;
+    result.discovered_match_count = plan.discovered_match_count();
+    result.longest_match_tokens = plan.longest_match_tokens();
     apply_timing(result, plan.timing());
     for (dst, src) in result.ranges.iter_mut().zip(ranges) {
         *dst = CacheReuseRange {
@@ -255,6 +269,7 @@ fn apply_result(result: &mut CacheReuseResult, plan: cache_reuse_utils::ReusePla
     for (dst, src) in result.insertions.iter_mut().zip(insertions) {
         *dst = CacheReuseInsertion {
             before_target_index: src.before_target_index,
+            prepared_start: src.prepared_start,
             token: src.token,
             count: src.count,
         };
@@ -405,4 +420,315 @@ pub unsafe extern "C" fn cache_reuse_plan(
             1
         }
     }
+}
+
+/// Result of `cache_reuse_common_prefix`. Field meanings match the core
+/// `CommonPrefix`.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct CacheReuseCommonPrefix {
+    /// Leading logical tokens of the physical sequence equal to the start of
+    /// the logical sequence.
+    pub common_logical_tokens: u32,
+    /// Physical tokens up to and including the last common logical token.
+    pub physical_prefix_tokens: u32,
+    /// Pads interleaved inside that physical prefix.
+    pub carried_pads: u32,
+    /// Logical (non-pad) tokens in the whole physical sequence.
+    pub live_logical_tokens: u32,
+}
+
+/// Run a status-returning bridge call with panic containment.
+fn run_status(
+    error: *mut c_char,
+    error_len: usize,
+    name: &str,
+    call: impl FnOnce() -> Result<(), String>,
+) -> u32 {
+    match catch_unwind(AssertUnwindSafe(call)) {
+        Ok(Ok(())) => CACHE_REUSE_COMPLETE,
+        Ok(Err(message)) => {
+            set_error(error, error_len, &message);
+            CACHE_REUSE_ERR_INVALID
+        }
+        Err(_) => {
+            set_error(error, error_len, &format!("{name} panicked"));
+            CACHE_REUSE_ERR_PANIC
+        }
+    }
+}
+
+/// Borrow `len` caller tokens as `u32` without copying. With
+/// `require_non_negative`, a negative token is rejected; otherwise token
+/// values are opaque and only compared or copied bit for bit.
+unsafe fn borrow_tokens<'a>(
+    pointer: *const i32,
+    len: u32,
+    what: &str,
+    require_non_negative: bool,
+) -> Result<&'a [u32], String> {
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if pointer.is_null() {
+        return Err(format!("{what} pointer is null"));
+    }
+    // i32 and u32 share size and alignment; the bits are reinterpreted.
+    let tokens = unsafe { slice::from_raw_parts(pointer.cast::<u32>(), len as usize) };
+    if require_non_negative && tokens.iter().any(|&token| token > i32::MAX as u32) {
+        return Err(format!("{what} contains a negative token"));
+    }
+    Ok(tokens)
+}
+
+/// Borrow `len` caller `u32` values without copying.
+unsafe fn borrow_u32<'a>(pointer: *const u32, len: u32, what: &str) -> Result<&'a [u32], String> {
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if pointer.is_null() {
+        return Err(format!("{what} pointer is null"));
+    }
+    Ok(unsafe { slice::from_raw_parts(pointer, len as usize) })
+}
+
+/// Borrow a caller output buffer of `len` elements.
+unsafe fn borrow_out<'a, T>(pointer: *mut T, len: u32, what: &str) -> Result<&'a mut [T], String> {
+    if len == 0 {
+        return Ok(&mut []);
+    }
+    if pointer.is_null() {
+        return Err(format!("{what} pointer is null"));
+    }
+    Ok(unsafe { slice::from_raw_parts_mut(pointer, len as usize) })
+}
+
+/// Rebuild the core recipe from a planner result for `target_len` tokens.
+fn recipe_of(result: &CacheReuseResult, target_len: u32) -> Result<PlacementRecipe, String> {
+    if result.status > CACHE_REUSE_STATE_LIMIT {
+        return Err("result does not hold a plan".into());
+    }
+    let range_count = result.range_count as usize;
+    let insertion_count = result.insertion_count as usize;
+    if range_count > CACHE_REUSE_MAX_RANGES || insertion_count > CACHE_REUSE_MAX_INSERTIONS {
+        return Err("result counts exceed ABI bounds".into());
+    }
+    if result.prepared_tokens.checked_sub(result.inserted_padding) != Some(target_len) {
+        return Err("target length does not match the result".into());
+    }
+    let insertions = &result.insertions[..insertion_count];
+    if insertions
+        .iter()
+        .any(|insertion| insertion.token > i32::MAX as u32)
+    {
+        return Err("result pad token is not a valid i32 token".into());
+    }
+    Ok(PlacementRecipe {
+        // Identity is correlation metadata and plays no part here.
+        cache_identity: CacheIdentity::new(0),
+        original_tokens: target_len,
+        prepared_tokens: result.prepared_tokens,
+        ranges: result.ranges[..range_count]
+            .iter()
+            .map(|range| PlacedRange {
+                source_start: range.source_start,
+                destination_start: range.destination_start,
+                token_count: range.count,
+                prepared_start: range.prepared_start,
+            })
+            .collect(),
+        insertions: insertions
+            .iter()
+            .map(|insertion| Insertion {
+                before_target_index: insertion.before_target_index,
+                prepared_start: insertion.prepared_start,
+                token: insertion.token,
+                count: insertion.count,
+            })
+            .collect(),
+    })
+}
+
+fn materialize_message(error: PlacementMaterializeError) -> String {
+    match error {
+        PlacementMaterializeError::InputShape => "output length does not match the result".into(),
+        PlacementMaterializeError::SourceRange => "result range exceeds the source".into(),
+        PlacementMaterializeError::ContentMismatch { index } => {
+            format!("source token differs from target token {index}")
+        }
+        PlacementMaterializeError::RecipeShape => "result recipe is inconsistent".into(),
+        PlacementMaterializeError::Allocation => "allocation refused".into(),
+    }
+}
+
+/// Write the prepared target for a planner `result` into caller buffers.
+///
+/// `out_prepared_len` must equal `result->prepared_tokens` and `target_len`
+/// the target length that was planned. When `out_pad_positions` is non-null
+/// or `out_pad_len` is nonzero, `out_pad_len` must equal
+/// `result->inserted_padding` and receives each pad's prepared index in
+/// increasing order. Every reused source token must equal the target token
+/// it replaces. Returns `CACHE_REUSE_COMPLETE`, `CACHE_REUSE_ERR_INVALID` or
+/// `CACHE_REUSE_ERR_PANIC`; on error the outputs may be partially written.
+/// Token buffers are borrowed, not copied.
+///
+/// # Safety
+///
+/// Each pointer must be valid for its stated length (`result` for one
+/// value) and may be null only for a zero length. Output buffers must not
+/// overlap any input.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cache_reuse_materialize(
+    target_tokens: *const i32,
+    target_len: u32,
+    source_tokens: *const i32,
+    source_len: u32,
+    result: *const CacheReuseResult,
+    out_prepared_tokens: *mut i32,
+    out_prepared_len: u32,
+    out_pad_positions: *mut u32,
+    out_pad_len: u32,
+    error_out: *mut c_char,
+    error_len: usize,
+) -> u32 {
+    run_status(error_out, error_len, "materialize", || {
+        if result.is_null() {
+            return Err("null planner result".into());
+        }
+        let target = unsafe { borrow_tokens(target_tokens, target_len, "target", true) }?;
+        let source = unsafe { borrow_tokens(source_tokens, source_len, "source", true) }?;
+        let recipe = recipe_of(unsafe { &*result }, target_len)?;
+        let prepared = unsafe {
+            borrow_out(
+                out_prepared_tokens.cast::<u32>(),
+                out_prepared_len,
+                "prepared output",
+            )
+        }?;
+        let pads = if out_pad_positions.is_null() && out_pad_len == 0 {
+            None
+        } else {
+            Some(unsafe { borrow_out(out_pad_positions, out_pad_len, "pad output") }?)
+        };
+        recipe
+            .materialize_into(target, source, prepared, pads)
+            .map_err(materialize_message)
+    })
+}
+
+/// Copy the logical (non-pad) tokens of a physical sequence.
+///
+/// `pad_positions` must be strictly increasing physical indices below
+/// `physical_len`. `out_logical_capacity` must be at least
+/// `physical_len - pad_len`; the count written is stored in
+/// `*out_logical_len`, which is set to 0 on error. Token values are opaque.
+///
+/// # Safety
+///
+/// Each pointer must be valid for its stated length and may be null only for
+/// a zero length; `out_logical_len` must be valid for one `u32`. Output
+/// buffers must not overlap any input.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cache_reuse_project_logical(
+    physical_tokens: *const i32,
+    physical_len: u32,
+    pad_positions: *const u32,
+    pad_len: u32,
+    out_logical_tokens: *mut i32,
+    out_logical_capacity: u32,
+    out_logical_len: *mut u32,
+    error_out: *mut c_char,
+    error_len: usize,
+) -> u32 {
+    run_status(error_out, error_len, "projection", || {
+        if out_logical_len.is_null() {
+            return Err("null logical length output".into());
+        }
+        unsafe { *out_logical_len = 0 };
+        let physical = unsafe { borrow_tokens(physical_tokens, physical_len, "physical", false) }?;
+        let pads = unsafe { borrow_u32(pad_positions, pad_len, "pad positions") }?;
+        let out = unsafe {
+            borrow_out(
+                out_logical_tokens.cast::<u32>(),
+                out_logical_capacity,
+                "logical output",
+            )
+        }?;
+        let written = cache_reuse_utils::project_to_logical(physical, pads, out)
+            .ok_or("invalid pad positions or logical output too small")?;
+        unsafe { *out_logical_len = written };
+        Ok(())
+    })
+}
+
+/// Store in `*out_logical_boundary` the number of logical tokens before
+/// `physical_boundary`. Set to 0 on error.
+///
+/// # Safety
+///
+/// `pad_positions` must be valid for `pad_len` values and may be null only
+/// for a zero length; `out_logical_boundary` must be valid for one `u32`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cache_reuse_logical_boundary(
+    physical_boundary: u32,
+    physical_len: u32,
+    pad_positions: *const u32,
+    pad_len: u32,
+    out_logical_boundary: *mut u32,
+    error_out: *mut c_char,
+    error_len: usize,
+) -> u32 {
+    run_status(error_out, error_len, "boundary mapping", || {
+        if out_logical_boundary.is_null() {
+            return Err("null logical boundary output".into());
+        }
+        unsafe { *out_logical_boundary = 0 };
+        let pads = unsafe { borrow_u32(pad_positions, pad_len, "pad positions") }?;
+        let boundary = cache_reuse_utils::logical_boundary(physical_boundary, physical_len, pads)
+            .ok_or("boundary beyond physical length or invalid pad positions")?;
+        unsafe { *out_logical_boundary = boundary };
+        Ok(())
+    })
+}
+
+/// Measure how much of `logical_tokens` the physical sequence already holds
+/// as a pad-skipping prefix. `*out` is zeroed on error. Token values are
+/// opaque.
+///
+/// # Safety
+///
+/// Each pointer must be valid for its stated length and may be null only for
+/// a zero length; `out` must be valid for one `CacheReuseCommonPrefix`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cache_reuse_common_prefix(
+    logical_tokens: *const i32,
+    logical_len: u32,
+    physical_tokens: *const i32,
+    physical_len: u32,
+    pad_positions: *const u32,
+    pad_len: u32,
+    out: *mut CacheReuseCommonPrefix,
+    error_out: *mut c_char,
+    error_len: usize,
+) -> u32 {
+    run_status(error_out, error_len, "common prefix", || {
+        if out.is_null() {
+            return Err("null common prefix output".into());
+        }
+        unsafe { *out = CacheReuseCommonPrefix::default() };
+        let logical = unsafe { borrow_tokens(logical_tokens, logical_len, "logical", false) }?;
+        let physical = unsafe { borrow_tokens(physical_tokens, physical_len, "physical", false) }?;
+        let pads = unsafe { borrow_u32(pad_positions, pad_len, "pad positions") }?;
+        let prefix = cache_reuse_utils::common_logical_prefix(logical, physical, pads)
+            .ok_or("invalid pad positions")?;
+        unsafe {
+            *out = CacheReuseCommonPrefix {
+                common_logical_tokens: prefix.common_logical_tokens,
+                physical_prefix_tokens: prefix.physical_prefix_tokens,
+                carried_pads: prefix.carried_pads,
+                live_logical_tokens: prefix.live_logical_tokens,
+            }
+        };
+        Ok(())
+    })
 }

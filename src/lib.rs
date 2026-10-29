@@ -1,8 +1,10 @@
 #![doc = include_str!("../README.md")]
+#![forbid(unsafe_code)]
 
 mod cache_reuse_analysis;
 mod cache_view;
 mod candidate;
+mod coordinates;
 mod discovery;
 mod error;
 mod placement;
@@ -13,6 +15,10 @@ mod timing;
 pub use cache_reuse_analysis::CacheReuseAnalysis;
 pub use cache_view::{CacheIdentity, CacheView};
 pub use candidate::MAX_RANGES;
+pub use coordinates::{
+    CommonPrefix, common_logical_prefix, logical_boundary, project_to_logical,
+    validate_pad_positions,
+};
 pub use discovery::DiscoveryStatus;
 pub use error::{AdmissionDeniedReason, ContractError, InputSide, PlanError, PlanErrorKind};
 pub use placement::{
